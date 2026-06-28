@@ -188,11 +188,26 @@ class TransformRestorer:
 
     def _compute_split_regions(self, w: int, h: int, lines: List[dict]
                                ) -> List[Tuple[int, int, int, int]]:
-        """根据分割线计算各子画面区域 (x, y, w, h)。"""
+        """根据分割线计算各子画面区域 (x, y, w, h)。
+
+        特殊处理：屏中屏（2 垂直 + 2 水平边）时，直接提取中间矩形窗口。
+        普通分屏时，保留面积超过主画面 50% 的子画面。
+        """
         if not lines:
             return [(0, 0, w, h)]
         v_lines = sorted([ln["position"] for ln in lines if ln["orientation"] == "vertical"])
         h_lines = sorted([ln["position"] for ln in lines if ln["orientation"] == "horizontal"])
+
+        # 屏中屏：2 垂直 + 2 水平边 → 直接提取中间矩形窗口
+        if len(v_lines) == 2 and len(h_lines) == 2:
+            x1 = int(v_lines[0] * w)
+            x2 = int(v_lines[1] * w)
+            y1 = int(h_lines[0] * h)
+            y2 = int(h_lines[1] * h)
+            cw = x2 - x1
+            ch = y2 - y1
+            if cw > 20 and ch > 20:
+                return [(x1, y1, cw, ch)]
 
         x_cuts = [0.0] + [p * w for p in v_lines] + [float(w)]
         y_cuts = [0.0] + [p * h for p in h_lines] + [float(h)]

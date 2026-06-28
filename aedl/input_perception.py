@@ -341,8 +341,6 @@ class InputPerception:
             elif abs(y1 - y2) < 2:         # 近似水平
                 candidate_lines.append(SplitLine(position=float(y1) / h, orientation="horizontal"))
         candidate_lines = self._dedupe_lines(candidate_lines)
-        if not candidate_lines:
-            return False, [], 0
 
         # 验证：分割线两侧区域必须有显著内容差异（颜色直方图距离）
         confirmed: List[SplitLine] = []
@@ -351,7 +349,80 @@ class InputPerception:
                 confirmed.append(ln)
         is_split = len(confirmed) > 0
         sub_count = len(confirmed) + 1 if is_split else 1
+
+        # 备选：屏中屏检测（直线检测失败时，用网格差异检测小窗口）
+        if not is_split:
+            inset_lines = self._detect_inset_screen(frames[0], w, h)
+            if inset_lines:
+                return True, inset_lines, 2
+
         return is_split, confirmed, sub_count
+
+    def _detect_inset_screen(self, frame: np.ndarray, w: int, h: int) -> List[SplitLine]:
+        """屏中屏检测：检测画面中小窗口（缩小有害画面嵌入无害背景）。
+
+        方法：
+        1. 用 Canny + findContours 找轮廓
+        2. 筛选面积适中（10%-70%画面）的矩形轮廓
+        3. 验证矩形内部与外部内容差异显著
+        4. 返回矩形的 4 条边作为分割线
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 30, 100)
+        # 形态学闭运算连接断裂的边缘
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        img_area = w * h
+        # 按面积降序，最多检查前 10 个轮廓
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < img_area * 0.05 or area > img_area * 0.7:
+                continue
+            # 多边形逼近，找矩形
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            if len(approx) != 4:
+                continue
+            # 获取矩形边界
+            x, y, cw, ch = cv2.boundingRect(approx)
+            if cw < w * 0.15 or ch < h * 0.15:
+                continue
+            # 验证内部与外部内容差异
+            if self._inset_differs(gray, x, y, cw, ch, w, h):
+                # 返回 4 条边作为分割线
+                return [
+                    SplitLine(position=float(x) / w, orientation="vertical"),
+                    SplitLine(position=float(x + cw) / w, orientation="vertical"),
+                    SplitLine(position=float(y) / h, orientation="horizontal"),
+                    SplitLine(position=float(y + ch) / h, orientation="horizontal"),
+                ]
+        return []
+
+    @staticmethod
+    def _inset_differs(gray: np.ndarray, x: int, y: int, cw: int, ch: int,
+                       w: int, h: int, diff_threshold: float = 0.3) -> bool:
+        """判断矩形窗口内部与外部的内容是否有显著差异。"""
+        inner = gray[y:y + ch, x:x + cw]
+        # 外部：取四周边缘带
+        outer_top = gray[:max(1, y - 5), :]
+        outer_bottom = gray[min(h - 1, y + ch + 5):, :]
+        outer_left = gray[:, :max(1, x - 5)]
+        outer_right = gray[:, min(w - 1, x + cw + 5):]
+        outer_parts = [p for p in [outer_top, outer_bottom, outer_left, outer_right] if p.size > 0]
+        if not outer_parts:
+            return False
+        outer = np.concatenate([p.flatten() for p in outer_parts])
+
+        hist_in = cv2.calcHist([inner], [0], None, [32], [0, 256]).flatten()
+        hist_out = cv2.calcHist([outer], [0], None, [32], [0, 256]).flatten()
+        hist_in = hist_in / max(hist_in.sum(), 1e-12)
+        hist_out = hist_out / max(hist_out.sum(), 1e-12)
+        diff = 0.5 * float(np.sum((hist_in - hist_out) ** 2 / (hist_in + hist_out + 1e-12)))
+        return diff > diff_threshold
 
     @staticmethod
     def _regions_differ(gray: np.ndarray, line: SplitLine, w: int, h: int,

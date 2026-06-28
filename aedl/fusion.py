@@ -199,31 +199,51 @@ class ResultFusion:
         - calibrated_score：推理增强后的校准分数（最准确）
         - category_scores：各类别分数（可能都低于阈值）
 
-        融合策略：
+        融合策略（与 category_scores 的严格策略不同，这里更宽松）：
         1. 原始版本的 calibrated/anomaly score 始终纳入（保底）
-        2. 还原版本的 calibrated/anomaly score 仅在有触发跃升时纳入
-           （未触发说明还原未带来新信息，纳入会引入变换后模型误判）
+        2. 还原版本的 calibrated/anomaly score 在以下任一条件满足时纳入：
+           a. 有触发跃升的标签（triggered_labels 非空）
+           b. 还原版本 is_harmful=true（模型判定违规）
+           c. 还原版本 calibrated_score > 原始 calibrated_score + 0.1（显著提升）
         3. 取融合后的 category_scores 最大值
         4. 返回以上三者的最大值
 
-        这样既保证不漏检（原始版本兜底 + 触发时还原版本增强），
-        又不会因变换后构图变化引入模型误判。
+        区别于 category_scores 的严格策略：
+        - category_scores 只在 flagged 时融合，避免类别污染
+        - anomaly_score 更宽松，避免漏检还原版本的真实违规信号
         """
         if triggered_labels is None:
             triggered_labels = set()
         if not reports or reports[0] is None:
             return max(final_scores.values()) if final_scores else 0.0
 
-        max_calibrated = 0.0
-        max_anomaly = 0.0
-        for i, r in enumerate(reports):
+        # 原始版本的分数作为保底
+        orig_detection = reports[0].get("detection") or reports[0]
+        orig_calibrated = float(orig_detection.get("calibrated_score", 0.0))
+        orig_anomaly = float(orig_detection.get("anomaly_score", 0.0))
+
+        max_calibrated = orig_calibrated
+        max_anomaly = orig_anomaly
+
+        # 还原版本：检查是否带来显著的违规信号
+        for i, r in enumerate(reports[1:], start=1):
             if r is None:
                 continue
             detection = r.get("detection") or r
-            # 原始版本始终纳入；还原版本只在有触发跃升时纳入
-            if i == 0 or triggered_labels:
-                max_calibrated = max(max_calibrated, float(detection.get("calibrated_score", 0.0)))
-                max_anomaly = max(max_anomaly, float(detection.get("anomaly_score", 0.0)))
+            restored_calibrated = float(detection.get("calibrated_score", 0.0))
+            restored_anomaly = float(detection.get("anomaly_score", 0.0))
+            restored_harmful = bool(detection.get("is_harmful", False))
+
+            # 纳入条件：有触发跃升 / 还原版本违规 / 还原分数显著提升
+            should_include = (
+                triggered_labels  # 有标签触发跃升
+                or restored_harmful  # 还原版本判定违规
+                or restored_calibrated > orig_calibrated + 0.1  # 显著提升
+            )
+            if should_include:
+                max_calibrated = max(max_calibrated, restored_calibrated)
+                max_anomaly = max(max_anomaly, restored_anomaly)
+
         max_cat = max(final_scores.values()) if final_scores else 0.0
         return max(max_calibrated, max_anomaly, max_cat)
 
