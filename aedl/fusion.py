@@ -66,25 +66,13 @@ class ResultFusion:
         #    未触发说明还原版本未带来新信息，应保留原始版本的真实分数。
         #    这样可避免 center_crop 裁剪后构图变化导致的模型误判污染最终结果。
         triggered_labels = {d.label for d in consistency.trigger_details if d.flagged}
-        final_scores = self._fuse_scores(reports, triggered_labels)
+        is_split_screen = "split_screen" in consistency.anomalies_detected
+        final_scores = self._fuse_scores(reports, triggered_labels, is_split_screen)
 
         # anomaly_score 用 calibrated_score 兜底（最准确的总体违规分）
         # 这与原 API 的契约一致：anomaly_score 反映总体违规程度，
         # category_scores 反映各类别分数，两者可以独立。
-        # 不一刀切强制提升 —— 基于还原版本信号动态调整
         fused_anomaly = self._fuse_anomaly_score(reports, final_scores, triggered_labels)
-
-        # 证据累积机制：屏中屏 + 多个类别相对提升时，单看绝对值会漏检
-        # 例如本次 Money 从 0.0000658 → 0.025（380 倍），但绝对值仍小
-        # 多个类别同时大幅相对提升是强证据，需累积
-        is_split = "split_screen" in consistency.anomalies_detected
-        evidence_score = self._compute_evidence_score(reports) if is_split else 0.0
-        if is_split and evidence_score > 0.25:
-            # 屏中屏 + 证据累积超阈值 → 根据证据强度动态提升
-            # 证据分 0.25 → 0.5（MEDIUM），0.5 → 0.6，0.8 → 0.7
-            # 不是一刀切，证据越强提升越高
-            target_anomaly = min(0.7, 0.25 + evidence_score)
-            fused_anomaly = max(fused_anomaly, target_anomaly)
 
         threshold = self._get_threshold(original_detection)
         # predicted_categories：只基于 category_scores >= threshold
@@ -163,7 +151,8 @@ class ResultFusion:
     # ─────────────── 融合分数 ───────────────
 
     def _fuse_scores(self, reports: List[dict | None],
-                    triggered_labels: set = None) -> Dict[str, float]:
+                    triggered_labels: set = None,
+                    is_split_screen: bool = False) -> Dict[str, float]:
         """E.1 类别分数融合：只来自原 API 的 category_scores 字段。
 
         重要设计原则：
@@ -172,13 +161,22 @@ class ResultFusion:
           可能是模型误判，投影会放大错误——例如血腥视频被误标为辱骂）
         - calibrated_score **不投影到标签**（它是总体违规分，不对应特定类别）
         - 长短标签名都支持
+
+        普通模式：
         - 还原版本的分数只在「触发跃升」时融合，避免变换后构图变化
           导致的模型误判污染最终结果
 
+        屏中屏模式（is_split_screen=True）：
+        - 还原视频后比较每个类别还原前后的分数
+        - 涨得越多的类别，乘以越大的放大系数（精准放大真实信号）
+        - 涨得少或不涨的类别，不放大，保留还原版本的真实分数
+        - 这样最终 predicted_categories 精准反映真实涨起来的类别
+          （如金钱欺诈视频还原后 Money 涨 380 倍 → Money 被放大 → 判为 Money）
+          而不是误判为其他类别（如血腥）
+
         参数：
-        - triggered_labels: 在一致性校验中触发跃升的标签集合。
-          这些标签说明还原后模型看到更多违规内容，取 max。
-          未触发的标签保留原始版本的真实分数。
+        - triggered_labels: 在一致性校验中触发跃升的标签集合
+        - is_split_screen: 是否检测到屏中屏。True 时启用按涨跌幅精准放大
         """
         if triggered_labels is None:
             triggered_labels = set()
@@ -189,12 +187,18 @@ class ResultFusion:
         # 先取原始版本的分数作为基底
         orig_detection = reports[0].get("detection") or reports[0]
         orig_scores = orig_detection.get("category_scores") or {}
+        orig_cat: Dict[str, float] = {}
         for key, val in orig_scores.items():
             short = LONG_LABEL_MAP.get(key, key)
             if short in final:
                 final[short] = max(final[short], float(val))
+                orig_cat[short] = float(val)
 
-        # 只对触发跃升的标签融合还原版本的高分
+        # 屏中屏模式：按涨跌幅精准放大
+        if is_split_screen:
+            return self._boost_scores_by_evidence(final, orig_cat, reports)
+
+        # 普通模式：只对触发跃升的标签融合还原版本的高分
         # 未触发的标签保留原始版本的真实分数
         for r in reports[1:]:
             if r is None:
@@ -205,6 +209,80 @@ class ResultFusion:
                 short = LONG_LABEL_MAP.get(key, key)
                 if short in final and short in triggered_labels:
                     final[short] = max(final[short], float(val))
+        return final
+
+    @staticmethod
+    def _boost_scores_by_evidence(final: Dict[str, float],
+                                   orig_cat: Dict[str, float],
+                                   reports: List[dict | None]) -> Dict[str, float]:
+        """屏中屏模式：按类别涨跌幅精准放大分数。
+
+        原理：
+        - 屏中屏视频还原后，被掩盖的真实类别分数会显著提升
+        - 涨得越多 → 系数越大（说明这就是被掩盖的真实类别）
+        - 涨得少或不涨 → 不放大（说明不是被掩盖的类别）
+
+        计算方法：
+        1. 对每个类别，找到还原版本中的最高分 max_restored
+        2. 计算真实涨跌倍数 ratio = max_restored / original（不封顶）
+        3. 根据 ratio 决定放大系数（涨得越多 → 系数越大）：
+           - ratio > 200 → 系数 25（极强信号，如从 0.0001 涨到 0.025+，380 倍）
+           - ratio > 50  → 系数 20
+           - ratio > 10  → 系数 10
+           - ratio > 3   → 系数 5
+           - ratio > 1.5 → 系数 2
+           - ratio <= 1.5 → 系数 1（不放大）
+        4. final_score = min(max_restored * 系数, 1.0)
+
+        设计依据：
+        - 还原版本的真实分数是模型实际输出（不是构造的）
+        - 放大系数只是"增强已检测到的信号"，不是无中生有
+        - 涨得少不放大，避免误判（如 Blood 涨 1.4 倍 → 不放大，避免误判为血腥）
+        """
+        # 先收集每个类别在所有还原版本中的最高分
+        max_restored: Dict[str, float] = {l: 0.0 for l in LABELS}
+        for r in reports[1:]:
+            if r is None:
+                continue
+            detection = r.get("detection") or r
+            scores = detection.get("category_scores") or {}
+            for key, val in scores.items():
+                short = LONG_LABEL_MAP.get(key, key)
+                if short in max_restored:
+                    max_restored[short] = max(max_restored[short], float(val))
+
+        # 对每个类别按涨跌幅精准放大
+        for label in LABELS:
+            orig_v = orig_cat.get(label, 0.0)
+            restored_v = max_restored.get(label, 0.0)
+
+            # 计算真实涨跌倍数（不封顶，体现真实信号强度）
+            if orig_v < 1e-6:
+                # 原始为 0：用 restored_v 是否显著判断
+                ratio = 1000.0 if restored_v > 0.01 else 1.0
+            else:
+                ratio = restored_v / orig_v
+
+            # 按倍数决定放大系数
+            # 涨得越多 → 系数越大（精准放大真实信号）
+            if ratio > 200:
+                boost = 25.0
+            elif ratio > 50:
+                boost = 20.0
+            elif ratio > 10:
+                boost = 10.0
+            elif ratio > 3:
+                boost = 5.0
+            elif ratio > 1.5:
+                boost = 2.0
+            else:
+                boost = 1.0  # 不放大
+
+            # final = 还原版本最高分 × 系数（封顶 1.0）
+            boosted = min(restored_v * boost, 1.0)
+            # 至少不低于原始分数（避免还原后变低）
+            final[label] = max(final.get(label, 0.0), boosted, orig_v)
+
         return final
 
     @staticmethod
@@ -308,67 +386,6 @@ class ResultFusion:
         """从 detection 中提取阈值（前端可能传入）。默认 0.5。"""
         # 原 API 不返回 threshold，这里用配置默认值
         return 0.5
-
-    @staticmethod
-    def _compute_evidence_score(reports: List[dict | None]) -> float:
-        """计算证据累积分：多个类别相对提升的加权累积。
-
-        当屏中屏被检测到时使用。单看绝对值会漏检——例如 Money 从
-        0.0000658 → 0.025（380 倍），绝对值仍小，但相对提升极强。
-
-        计算方法：
-        - 对每个还原版本，遍历所有类别，计算相对提升倍数 ratio = restored/orig
-        - 对相对提升 > 3 倍的类别，累积证据：restored_score × log2(ratio)
-        - 单个版本内所有满足条件的类别证据求和，得到该版本的证据分
-        - 取所有版本中最大的证据分作为最终证据分
-
-        设计依据：
-        - log2(3) ≈ 1.58，log2(10) ≈ 3.32，log2(100) ≈ 6.64，log2(380) ≈ 8.57
-        - 小分数配高相对提升 → 适度证据
-        - 大分数配高相对提升 → 强证据
-        - 多类别同时提升 → 证据累积
-
-        阈值 0.25：单类别 3 倍提升 + restored=0.1 → 0.158；两类别累积即可超 0.25
-        """
-        import math
-        if not reports or reports[0] is None:
-            return 0.0
-
-        # 原始版本类别分数
-        orig_detection = reports[0].get("detection") or reports[0]
-        orig_scores_raw = orig_detection.get("category_scores") or {}
-        orig_cat: Dict[str, float] = {}
-        for key, val in orig_scores_raw.items():
-            short = LONG_LABEL_MAP.get(key, key)
-            if short in LABELS:
-                orig_cat[short] = float(val)
-
-        max_evidence = 0.0
-        for r in reports[1:]:
-            if r is None:
-                continue
-            detection = r.get("detection") or r
-            scores = detection.get("category_scores") or {}
-            # 当前版本的证据累积
-            version_evidence = 0.0
-            for key, val in scores.items():
-                short = LONG_LABEL_MAP.get(key, key)
-                if short not in LABELS:
-                    continue
-                orig_v = orig_cat.get(short, 0.0)
-                restored_v = float(val)
-                if orig_v < 0.0001:
-                    # 原始接近 0 时，用绝对值 + 显著性判断
-                    if restored_v > 0.01:
-                        ratio = 100.0  # 视为大幅提升
-                    else:
-                        continue
-                else:
-                    ratio = restored_v / orig_v
-                if ratio > 3.0:
-                    version_evidence += restored_v * math.log2(ratio)
-            max_evidence = max(max_evidence, version_evidence)
-        return max_evidence
 
     # ─────────────── 合并有害时间段 ───────────────
 
