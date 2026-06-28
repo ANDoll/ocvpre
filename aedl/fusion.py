@@ -79,11 +79,11 @@ class ResultFusion:
         # 多个类别同时大幅相对提升是强证据，需累积
         is_split = "split_screen" in consistency.anomalies_detected
         evidence_score = self._compute_evidence_score(reports) if is_split else 0.0
-        if is_split and evidence_score > 0.3:
+        if is_split and evidence_score > 0.25:
             # 屏中屏 + 证据累积超阈值 → 根据证据强度动态提升
-            # 证据分 0.3 → 0.5（MEDIUM），0.5 → 0.6，0.8 → 0.7
+            # 证据分 0.25 → 0.5（MEDIUM），0.5 → 0.6，0.8 → 0.7
             # 不是一刀切，证据越强提升越高
-            target_anomaly = min(0.7, 0.4 + evidence_score)
+            target_anomaly = min(0.7, 0.25 + evidence_score)
             fused_anomaly = max(fused_anomaly, target_anomaly)
 
         threshold = self._get_threshold(original_detection)
@@ -328,7 +328,7 @@ class ResultFusion:
         - 大分数配高相对提升 → 强证据
         - 多类别同时提升 → 证据累积
 
-        阈值 0.3：单类别 3 倍提升 + restored=0.1 → 0.158；两类别累积即可超 0.3
+        阈值 0.25：单类别 3 倍提升 + restored=0.1 → 0.158；两类别累积即可超 0.25
         """
         import math
         if not reports or reports[0] is None:
