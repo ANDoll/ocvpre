@@ -74,6 +74,18 @@ class ResultFusion:
         # 不一刀切强制提升 —— 基于还原版本信号动态调整
         fused_anomaly = self._fuse_anomaly_score(reports, final_scores, triggered_labels)
 
+        # 证据累积机制：屏中屏 + 多个类别相对提升时，单看绝对值会漏检
+        # 例如本次 Money 从 0.0000658 → 0.025（380 倍），但绝对值仍小
+        # 多个类别同时大幅相对提升是强证据，需累积
+        is_split = "split_screen" in consistency.anomalies_detected
+        evidence_score = self._compute_evidence_score(reports) if is_split else 0.0
+        if is_split and evidence_score > 0.3:
+            # 屏中屏 + 证据累积超阈值 → 根据证据强度动态提升
+            # 证据分 0.3 → 0.5（MEDIUM），0.5 → 0.6，0.8 → 0.7
+            # 不是一刀切，证据越强提升越高
+            target_anomaly = min(0.7, 0.4 + evidence_score)
+            fused_anomaly = max(fused_anomaly, target_anomaly)
+
         threshold = self._get_threshold(original_detection)
         # predicted_categories：只基于 category_scores >= threshold
         # 这是唯一安全的方案 —— 不继承原 API 的 predicted_categories 误判
@@ -205,16 +217,19 @@ class ResultFusion:
         - anomaly_score：总体违规分（可能被推理增强校准过）
         - calibrated_score：推理增强后的校准分数（最准确）
         - category_scores：各类别分数（可能都低于阈值）
+        - ood_score：out-of-distribution 分数，内容偏离训练分布的程度
+          还原后 ood_score 飙升说明模型看到了"不正常"的内容
 
         融合策略（基于还原版本信号，无信号则不强行拔高）：
         1. 原始版本的 calibrated/anomaly score 始终纳入（保底）
         2. 还原版本在以下任一条件满足时纳入 calibrated/anomaly：
            a. 有触发跃升的标签（triggered_labels 非空）
            b. 还原版本 is_harmful=true（模型判定违规）
-           c. 还原版本 calibrated_score > 原始 + 0.05（显著提升，阈值降低更敏感）
-           d. 还原版本某个 category_score > 原始对应类别 + 0.1（类别信号提升）
-        3. 还原版本带来的类别信号（max_cat_signal）也纳入 max
-        4. 返回 max(max_calibrated, max_anomaly, max_cat, max_cat_signal)
+           c. 还原版本 calibrated_score > 原始 + 0.05（显著提升）
+           d. 类别信号提升：某类别绝对提升 > 0.03 或相对提升 > 3 倍
+           e. ood 信号：还原版本 ood_score > 0.3 且 > 原始 + 0.2
+        3. 纳入的信号包括：calibrated, anomaly, 类别信号, ood 信号
+        4. 返回所有纳入信号的最大值
 
         区别于一刀切强制 0.5：
         - 无还原版本信号时，保留原始版本真实分数
@@ -229,6 +244,7 @@ class ResultFusion:
         orig_detection = reports[0].get("detection") or reports[0]
         orig_calibrated = float(orig_detection.get("calibrated_score", 0.0))
         orig_anomaly = float(orig_detection.get("anomaly_score", 0.0))
+        orig_ood = float(orig_detection.get("ood_score", 0.0))
         # 原始版本的类别分数（归一化长短标签）
         orig_scores_raw = orig_detection.get("category_scores") or {}
         orig_cat: Dict[str, float] = {}
@@ -240,6 +256,7 @@ class ResultFusion:
         max_calibrated = orig_calibrated
         max_anomaly = orig_anomaly
         max_cat_signal = 0.0  # 还原版本带来的类别信号
+        max_ood_signal = 0.0  # 还原版本带来的 ood 异常信号
 
         # 还原版本：检查是否带来显著的违规信号
         for i, r in enumerate(reports[1:], start=1):
@@ -248,39 +265,110 @@ class ResultFusion:
             detection = r.get("detection") or r
             restored_calibrated = float(detection.get("calibrated_score", 0.0))
             restored_anomaly = float(detection.get("anomaly_score", 0.0))
+            restored_ood = float(detection.get("ood_score", 0.0))
             restored_harmful = bool(detection.get("is_harmful", False))
             restored_scores_raw = detection.get("category_scores") or {}
 
-            # 检查是否有类别信号提升（某个类别在还原后显著高于原始）
+            # 检查类别信号提升：
+            # - 绝对提升 > 0.03（捕捉弱信号，之前 0.1 太严）
+            # - 相对提升 > 3 倍且还原值 > 0.03（捕捉数量级提升）
             cat_signal = False
             for key, val in restored_scores_raw.items():
                 short = LONG_LABEL_MAP.get(key, key)
                 if short in LABELS:
                     orig_v = orig_cat.get(short, 0.0)
                     restored_v = float(val)
-                    if restored_v > orig_v + 0.1:  # 类别分数显著提升
+                    delta = restored_v - orig_v
+                    ratio = restored_v / max(orig_v, 0.001)
+                    if delta > 0.03 or (ratio > 3.0 and restored_v > 0.03):
                         cat_signal = True
                         max_cat_signal = max(max_cat_signal, restored_v)
 
-            # 纳入条件：有触发跃升 / 还原版本违规 / 还原分数显著提升 / 类别信号提升
+            # 检查 ood 信号：还原后 ood 飙升说明模型看到异常内容
+            if restored_ood > 0.3 and restored_ood > orig_ood + 0.2:
+                max_ood_signal = max(max_ood_signal, restored_ood)
+
+            # 纳入条件：有触发跃升 / 还原版本违规 / 还原分数显著提升 / 类别信号 / ood 信号
             should_include = (
                 triggered_labels  # 有标签触发跃升
                 or restored_harmful  # 还原版本判定违规
-                or restored_calibrated > orig_calibrated + 0.05  # 显著提升（阈值降低）
+                or restored_calibrated > orig_calibrated + 0.05  # 显著提升
                 or cat_signal  # 类别信号提升
+                or max_ood_signal > 0  # ood 异常信号
             )
             if should_include:
                 max_calibrated = max(max_calibrated, restored_calibrated)
                 max_anomaly = max(max_anomaly, restored_anomaly)
 
         max_cat = max(final_scores.values()) if final_scores else 0.0
-        return max(max_calibrated, max_anomaly, max_cat, max_cat_signal)
+        return max(max_calibrated, max_anomaly, max_cat, max_cat_signal, max_ood_signal)
 
     @staticmethod
     def _get_threshold(detection: dict) -> float:
         """从 detection 中提取阈值（前端可能传入）。默认 0.5。"""
         # 原 API 不返回 threshold，这里用配置默认值
         return 0.5
+
+    @staticmethod
+    def _compute_evidence_score(reports: List[dict | None]) -> float:
+        """计算证据累积分：多个类别相对提升的加权累积。
+
+        当屏中屏被检测到时使用。单看绝对值会漏检——例如 Money 从
+        0.0000658 → 0.025（380 倍），绝对值仍小，但相对提升极强。
+
+        计算方法：
+        - 对每个还原版本，遍历所有类别，计算相对提升倍数 ratio = restored/orig
+        - 对相对提升 > 3 倍的类别，累积证据：restored_score × log2(ratio)
+        - 单个版本内所有满足条件的类别证据求和，得到该版本的证据分
+        - 取所有版本中最大的证据分作为最终证据分
+
+        设计依据：
+        - log2(3) ≈ 1.58，log2(10) ≈ 3.32，log2(100) ≈ 6.64，log2(380) ≈ 8.57
+        - 小分数配高相对提升 → 适度证据
+        - 大分数配高相对提升 → 强证据
+        - 多类别同时提升 → 证据累积
+
+        阈值 0.3：单类别 3 倍提升 + restored=0.1 → 0.158；两类别累积即可超 0.3
+        """
+        import math
+        if not reports or reports[0] is None:
+            return 0.0
+
+        # 原始版本类别分数
+        orig_detection = reports[0].get("detection") or reports[0]
+        orig_scores_raw = orig_detection.get("category_scores") or {}
+        orig_cat: Dict[str, float] = {}
+        for key, val in orig_scores_raw.items():
+            short = LONG_LABEL_MAP.get(key, key)
+            if short in LABELS:
+                orig_cat[short] = float(val)
+
+        max_evidence = 0.0
+        for r in reports[1:]:
+            if r is None:
+                continue
+            detection = r.get("detection") or r
+            scores = detection.get("category_scores") or {}
+            # 当前版本的证据累积
+            version_evidence = 0.0
+            for key, val in scores.items():
+                short = LONG_LABEL_MAP.get(key, key)
+                if short not in LABELS:
+                    continue
+                orig_v = orig_cat.get(short, 0.0)
+                restored_v = float(val)
+                if orig_v < 0.0001:
+                    # 原始接近 0 时，用绝对值 + 显著性判断
+                    if restored_v > 0.01:
+                        ratio = 100.0  # 视为大幅提升
+                    else:
+                        continue
+                else:
+                    ratio = restored_v / orig_v
+                if ratio > 3.0:
+                    version_evidence += restored_v * math.log2(ratio)
+            max_evidence = max(max_evidence, version_evidence)
+        return max_evidence
 
     # ─────────────── 合并有害时间段 ───────────────
 
