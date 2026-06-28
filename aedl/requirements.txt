@@ -1,0 +1,22 @@
+# AEDL 对抗规避检测层依赖
+# 对应方案文档「七、4 依赖清单」
+
+# Web 服务
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+
+# HTTP 客户端（调用原 /api/v1/detect）
+httpx>=0.24.0
+
+# CV 算子（镜像/边缘/画质/分屏/光流/CLAHE/去噪）
+opencv-python>=4.8.0
+
+# 数值计算
+numpy>=1.24.0
+
+# 配置文件
+pyyaml>=6.0
+
+# 数据校验
+pydantic>=2.0.0

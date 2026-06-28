@@ -1,0 +1,6 @@
+# AEDL 白名单
+# 每行一个上传者标识（user_id），# 开头为注释
+# 命中白名单的视频跳过全部 AEDL 检测直接送审
+
+# example_user_001
+# trusted_partner_002

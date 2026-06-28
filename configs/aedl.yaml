@@ -1,0 +1,75 @@
+# AEDL 配置文件
+# 对应方案文档「六、关键参数与阈值汇总」
+# 所有阈值均为建议初始值，上线后需根据实际误报/漏报数据迭代校准。
+
+perception:
+  mirror_ssim_threshold: 0.95
+  mirror_saliency_weight: 0.5
+  border_ratio_range: [0.05, 0.10]
+  border_variance_threshold: 50.0
+  laplacian_threshold_720p: 80.0
+  laplacian_threshold_1080p: 150.0
+  laplacian_threshold_4k: 400.0
+  blocking_artifact_threshold: 0.5
+  split_line_min_ratio: 0.8
+  speed_audio_threshold: 1.5
+  speed_visual_flow_std: 2.0
+  max_frames_to_check: 3
+  fast_check_time_ms: 50
+  # 扩展：垂直翻转检测
+  vflip_ssim_threshold: 0.90
+  # 扩展：亮度异常检测（蒙版/调暗/半透明）
+  dark_brightness_threshold: 40.0
+  # 扩展：闪烁检测
+  flicker_check_frames: 12
+  flicker_brightness_threshold: 25.0
+
+router:
+  max_restored_versions: 4
+  max_transform_chain: 2
+  min_confidence_to_trigger: 0.3
+  whitelist_enabled: true
+  whitelist_path: configs/whitelist.txt
+  # 保险还原变换：无视感知层，默认对所有视频追加这些变换链送审
+  # 由模块 D 一致性校验层通过分数对比判断是否真的存在规避
+  # 支持：mirror（水平翻转）、vflip（垂直翻转）、brighten（亮度增强）
+  force_restore_transforms:
+    - mirror
+    - vflip
+    - brighten
+
+transform:
+  center_crop_min: 0.80
+  center_crop_max: 0.95
+  center_crop_default: 0.90
+  gamma_value: 0.8
+  clahe_clip_limit: 2.0
+  gaussian_kernel: 3
+  gaussian_sigma: 0.8
+  denoise_h: 3.0
+  split_subarea_min_ratio: 0.5
+
+consistency:
+  label_jump_threshold: 0.4
+  label_cliff_threshold: 0.5
+  restored_high_confidence: 0.8
+  jsd_threshold: 0.15
+  evasion_weights: [0.35, 0.25, 0.25, 0.15]
+  high_risk_threshold: 0.7
+  medium_risk_threshold: 0.5
+  low_risk_threshold: 0.2
+
+backend:
+  # 原 NSFW Detector API 地址
+  base_url: http://localhost:8000
+  detect_endpoint: /api/v1/detect
+  timeout: 120
+  max_retries: 2
+
+server:
+  host: 0.0.0.0
+  port: 8001
+  cors_allow_origins:
+    - "*"
+  temp_dir: temp_aedl
+  max_upload_size_mb: 500
