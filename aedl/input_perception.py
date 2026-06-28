@@ -38,6 +38,15 @@ class InputPerception:
         dark_flag, mean_bright = self._detect_darkness(frames)
         flicker_flag, flicker_score = self._detect_flicker(video_path, fps)
 
+        # 屏中屏保险：flicker 触发但 split 未触发时，用帧差法重试
+        # 屏中屏内的动态内容会触发闪烁误判，此时应检测到屏中屏
+        if flicker_flag and not split_flag:
+            inset_lines = self._find_inset_by_frame_diff(video_path, fps, w, h)
+            if inset_lines:
+                split_flag = True
+                lines = inset_lines
+                sub_cnt = 2
+
         anomalies = [mirror_flag, vflip_flag, border_flag, degraded_flag,
                      split_flag, speed_flag, dark_flag, flicker_flag]
         count = sum(anomalies)
@@ -398,16 +407,16 @@ class InputPerception:
                 block = gray[i*bh:(i+1)*bh, j*bw:(j+1)*bw]
                 std_map[i, j] = float(block.std())
 
-        # 自适应阈值：整体方差的 0.5 倍，最低 8.0
+        # 自适应阈值：整体方差的 0.4 倍，最低 6.0（放宽，避免漏检小窗口）
         global_std = float(gray.std())
-        threshold = max(global_std * 0.5, 8.0)
+        threshold = max(global_std * 0.4, 6.0)
 
         # 二值化：高方差块为 1（有内容），低方差块为 0（背景）
         binary = (std_map > threshold).astype(np.uint8)
 
-        # 形态学开运算（erosion + dilation）去除孤立噪声
-        # 用 3x3 核做开运算，需要至少 3x3 的连通区域才能保留
-        kernel = np.ones((3, 3), dtype=np.uint8)
+        # 形态学开运算去除孤立噪声
+        # 用 2x2 核做开运算（比 3x3 更宽松，保留小窗口）
+        kernel = np.ones((2, 2), dtype=np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
         # 再次膨胀，连接近邻的高方差块
@@ -427,7 +436,7 @@ class InputPerception:
                 max_area = area
                 max_label = label
 
-        if max_label == 0 or max_area < 9:  # 至少 3x3 = 9 块
+        if max_label == 0 or max_area < 4:  # 至少 2x2 = 4 块（放宽，支持小窗口）
             return []
 
         # 只保留最大连通组件
@@ -447,12 +456,12 @@ class InputPerception:
         cw = x2 - x1
         ch = y2 - y1
 
-        # 面积筛选：5%-70% 画面
+        # 面积筛选：3%-70% 画面（放宽下限，支持小窗口）
         area_ratio = (cw * ch) / (w * h)
-        if area_ratio < 0.05 or area_ratio > 0.7:
+        if area_ratio < 0.03 or area_ratio > 0.7:
             return []
 
-        # 内部方差必须显著高于边缘带
+        # 内部方差必须显著高于边缘带（放宽条件：1.5 倍而非 2.0）
         margin_blocks = 2
         top_bg = std_map[:margin_blocks, :].mean()
         bottom_bg = std_map[-margin_blocks:, :].mean()
@@ -460,7 +469,7 @@ class InputPerception:
         right_bg = std_map[:, -margin_blocks:].mean()
         inner_std = std_map[r_min:r_max+1, c_min:c_max+1].mean()
         bg_min = min(top_bg, bottom_bg, left_bg, right_bg)
-        if inner_std < bg_min * 2.0 or inner_std < 10.0:
+        if inner_std < bg_min * 1.5 or inner_std < 8.0:
             return []
 
         return [
@@ -499,6 +508,109 @@ class InputPerception:
                     SplitLine(position=float(y + ch) / h, orientation="horizontal"),
                 ]
         return []
+
+    def _find_inset_by_frame_diff(self, video_path: str, fps: float, w: int, h: int) -> List[SplitLine]:
+        """帧差法检测屏中屏（对动态窗口 + 静态背景最有效）。
+
+        原理：屏中屏内的有害视频是动态的，会产生帧间差异；
+        背景是静态的，没有帧间差异。通过块差异分析定位窗口。
+
+        适用场景：方差分析失效（窗口边缘软化或背景有纹理），
+        但窗口内容是动态视频时，帧差法能精确定位。
+        """
+        if fps <= 0 or w == 0 or h == 0:
+            return []
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return []
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total < 4:
+            cap.release()
+            return []
+
+        # 均匀采样 6 帧
+        n = 6
+        indices = np.linspace(0, total - 1, n, dtype=int)
+        gray_frames = []
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame = cap.read()
+            if ret:
+                gray_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        cap.release()
+
+        if len(gray_frames) < 3:
+            return []
+
+        # 累加相邻帧差异
+        diff_sum = np.zeros((h, w), dtype=np.float32)
+        for i in range(len(gray_frames) - 1):
+            diff = cv2.absdiff(gray_frames[i], gray_frames[i + 1])
+            diff_sum += diff.astype(np.float32)
+        diff_avg = diff_sum / max(len(gray_frames) - 1, 1)
+
+        # 块差异分析（12x12 网格）
+        gh, gw = 12, 12
+        bh, bw = h // gh, w // gw
+        if bh < 10 or bw < 10:
+            return []
+
+        diff_map = np.zeros((gh, gw), dtype=np.float32)
+        for i in range(gh):
+            for j in range(gw):
+                block = diff_avg[i*bh:(i+1)*bh, j*bw:(j+1)*bw]
+                diff_map[i, j] = float(block.mean())
+
+        # 阈值：整体差异的 2 倍（窗口差异应显著高于背景）
+        global_diff = float(diff_avg.mean())
+        threshold = max(global_diff * 2.0, 5.0)
+
+        binary = (diff_map > threshold).astype(np.uint8)
+
+        # 形态学开运算
+        kernel = np.ones((2, 2), dtype=np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary = cv2.dilate(binary, kernel, iterations=1)
+
+        # 找最大连通组件
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        if num_labels <= 1:
+            return []
+
+        max_area = 0
+        max_label = 0
+        for label in range(1, num_labels):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area > max_area:
+                max_area = area
+                max_label = label
+
+        if max_label == 0 or max_area < 4:
+            return []
+
+        binary = (labels == max_label).astype(np.uint8)
+        rows = np.any(binary, axis=1)
+        cols = np.any(binary, axis=0)
+        r_min, r_max = np.where(rows)[0][[0, -1]]
+        c_min, c_max = np.where(cols)[0][[0, -1]]
+
+        x1 = int(c_min * bw)
+        y1 = int(r_min * bh)
+        x2 = int((c_max + 1) * bw)
+        y2 = int((r_max + 1) * bh)
+        cw = x2 - x1
+        ch = y2 - y1
+
+        area_ratio = (cw * ch) / (w * h)
+        if area_ratio < 0.03 or area_ratio > 0.7:
+            return []
+
+        return [
+            SplitLine(position=float(x1) / w, orientation="vertical"),
+            SplitLine(position=float(x2) / w, orientation="vertical"),
+            SplitLine(position=float(y1) / h, orientation="horizontal"),
+            SplitLine(position=float(y2) / h, orientation="horizontal"),
+        ]
 
     @staticmethod
     def _inset_differs(gray: np.ndarray, x: int, y: int, cw: int, ch: int,
