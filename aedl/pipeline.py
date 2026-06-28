@@ -30,6 +30,19 @@ class AEDLPipeline:
         self.backend = BackendClient(cfg.backend)
         self.consistency = ConsistencyChecker(cfg.consistency)
         self.fusion = ResultFusion(cfg.consistency)
+        self._clip_reranker = None  # 延迟加载，避免启动时加载 CLIP
+
+    @property
+    def clip_reranker(self):
+        """延迟加载 CLIP re-ranker（只在第一次需要时加载）。"""
+        if self._clip_reranker is None and self.cfg.clip_rerank.enabled:
+            try:
+                from .clip_rerank import ClipReranker
+                self._clip_reranker = ClipReranker(self.cfg.clip_rerank)
+            except Exception as e:
+                print(f"[AEDL] CLIP re-rank 加载失败，将跳过: {e}")
+                self._clip_reranker = None
+        return self._clip_reranker
 
     async def detect(self, video_path: str,
                      threshold: float | None = None,
@@ -53,6 +66,31 @@ class AEDLPipeline:
         reports, inference_ms = await self.backend.detect_all(
             [v.video_path for v in versions], threshold
         )
+
+        # 4.5 CLIP re-rank（屏中屏模式专属）
+        # 原模型在 anomaly_score < 0.5 时不触发 CLIP re-rank，
+        # category_scores 基于 SVLA logits2 可能有偏置。
+        # AEDL 侧自做 CLIP re-rank，用纯 CLIP 信号重新计算 category_scores。
+        if perception_result.is_split_screen and self.clip_reranker is not None:
+            t_rerank = time.time()
+            for i, (version, report) in enumerate(zip(versions, reports)):
+                if report is None:
+                    continue
+                detection = report.get("detection") or report
+                anomaly = float(detection.get("anomaly_score", 0.0))
+                if anomaly < 0.5:  # 只对未触发原模型 re-rank 的版本做 AEDL 侧 re-rank
+                    try:
+                        new_scores = self.clip_reranker.rerank(version.video_path, anomaly)
+                        detection["category_scores"] = new_scores
+                        # 重新计算 predicted_categories
+                        detection["predicted_categories"] = [
+                            cat for cat, score in sorted(new_scores.items(),
+                                                         key=lambda x: x[1], reverse=True)
+                            if score >= 0.5
+                        ]
+                    except Exception as e:
+                        print(f"[AEDL] CLIP re-rank 失败 (version {version.version_id}): {e}")
+            inference_ms += (time.time() - t_rerank) * 1000
 
         # 5. 模块 D：一致性校验
         consistency_result = self.consistency.check(versions, reports, perception_result)

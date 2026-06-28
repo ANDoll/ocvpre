@@ -20,3 +20,10 @@ pyyaml>=6.0
 
 # 数据校验
 pydantic>=2.0.0
+
+# CLIP re-rank（屏中屏模式：用纯 CLIP 信号重新计算 category_scores）
+# torch 和 clip 复用网页模型 D:/nsfwtest/NFSW_Detector/clip 的本地包
+torch>=1.7.1
+pillow>=8.0.0
+packaging>=20.0
+

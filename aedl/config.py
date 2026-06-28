@@ -98,6 +98,17 @@ class ServerConfig:
 
 
 @dataclass
+class ClipRerankConfig:
+    """CLIP re-rank 配置（屏中屏模式专属）"""
+    enabled: bool = True                       # 是否启用 CLIP re-rank
+    clip_variant: str = "ViT-B/16"             # CLIP 模型变体（与网页模型一致）
+    clip_module_path: str = "D:/nsfwtest/NFSW_Detector/clip"  # 网页模型 clip 包路径
+    num_frames: int = 8                        # 抽帧数量
+    topk_frames: int = 3                       # 取 top-k 帧相似度平均
+    batch_size: int = 8                        # CLIP 视觉特征提取批大小
+
+
+@dataclass
 class AEDLConfig:
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
     router: RouterConfig = field(default_factory=RouterConfig)
@@ -105,6 +116,7 @@ class AEDLConfig:
     consistency: ConsistencyConfig = field(default_factory=ConsistencyConfig)
     backend: BackendConfig = field(default_factory=BackendConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
+    clip_rerank: ClipRerankConfig = field(default_factory=ClipRerankConfig)
 
 
 def load_config(yaml_path: str | None = None) -> AEDLConfig:

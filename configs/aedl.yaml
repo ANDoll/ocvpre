@@ -73,3 +73,11 @@ server:
     - "*"
   temp_dir: temp_aedl
   max_upload_size_mb: 500
+
+clip_rerank:
+  enabled: true
+  clip_variant: "ViT-B/16"
+  clip_module_path: "D:/nsfwtest/NFSW_Detector/clip"
+  num_frames: 8
+  topk_frames: 3
+  batch_size: 8
