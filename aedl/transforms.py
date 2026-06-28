@@ -73,7 +73,7 @@ class TransformRestorer:
                 ratio = spec.params.get("ratio", self.cfg.center_crop_default)
                 crop_rect = self._compute_crop_rect(w, h, ratio)
                 out_w, out_h = crop_rect[2], crop_rect[3]
-            elif spec.name == "split_extract":
+            elif spec.name == "split_extract" or spec.name == "split_extract+brighten":
                 split_regions = self._compute_split_regions(w, h, spec.params.get("lines", []))
                 if split_regions:
                     # 取最大子画面
@@ -138,6 +138,10 @@ class TransformRestorer:
             return self._denoise(frame, use_g)
         if spec.name == "split_extract":
             return self._extract_main_region(frame, split_regions)
+        if spec.name == "split_extract+brighten":
+            # 组合变换：先提取窗口，再增强亮度
+            extracted = self._extract_main_region(frame, split_regions)
+            return self._brighten(extracted)
         if spec.name == "resample":
             return frame  # 抽帧在 _apply_chain 中处理
         return frame

@@ -39,7 +39,7 @@ class PerceptionConfig:
 @dataclass
 class RouterConfig:
     """模块 B 阈值"""
-    max_restored_versions: int = 4            # 含原始共最多 5 版本
+    max_restored_versions: int = 6            # 含原始共最多 7 版本（支持分屏组合变换）
     max_transform_chain: int = 2              # 单变换链最多串联 2 项
     min_confidence_to_trigger: float = 0.3    # 低于此值不触发变换
     whitelist_enabled: bool = True

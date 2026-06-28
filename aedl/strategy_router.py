@@ -28,6 +28,13 @@ class StrategyRouter:
         if perception.has_anomaly and perception.anomaly_count > 0:
             anomaly_chains = self._build_chains(perception)
 
+        # 分屏/屏中屏特别处理：额外追加 split_extract+brighten 组合链
+        # 因为缩小的有害画面往往伴随亮度不足，单独 split_extract 可能不够，
+        # 叠加 brighten 增强亮度，让原模型能更清晰地看到放大的有害画面
+        if perception.is_split_screen:
+            lines = [{"position": ln.position, "orientation": ln.orientation} for ln in perception.split_lines]
+            anomaly_chains.append([TransformSpec(name="split_extract+brighten", params={"lines": lines})])
+
         # 保险还原变换：无视感知层是否检测到异常，
         # 默认对所有视频追加这些变换链送审。
         # 由模块 D 一致性校验层通过分数对比判断是否真的存在规避。
@@ -87,6 +94,7 @@ class StrategyRouter:
 
         if p.is_split_screen:
             lines = [{"position": ln.position, "orientation": ln.orientation} for ln in p.split_lines]
+            # 单独 split_extract 变换
             anomalies.append(("split", 1.0,
                               TransformSpec(name="split_extract", params={"lines": lines})))
 

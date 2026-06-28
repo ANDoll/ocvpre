@@ -25,7 +25,7 @@ perception:
   flicker_brightness_threshold: 25.0
 
 router:
-  max_restored_versions: 4
+  max_restored_versions: 6
   max_transform_chain: 2
   min_confidence_to_trigger: 0.3
   whitelist_enabled: true

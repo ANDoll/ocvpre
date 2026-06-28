@@ -102,8 +102,13 @@ class ResultFusion:
         )
 
         # 构造 AEDL 规避分析附加字段
-        needs_review = consistency.evasion_level in ("medium", "high")
-        priority = consistency.evasion_level if consistency.evasion_level != "none" else "none"
+        # 分屏/屏中屏检测：强制人工审核（不依赖原模型判断，因为原模型对缩小画面检测能力有限）
+        forced_review = "split_screen" in consistency.anomalies_detected
+        needs_review = forced_review or consistency.evasion_level in ("medium", "high")
+        if forced_review:
+            priority = "high"
+        else:
+            priority = consistency.evasion_level if consistency.evasion_level != "none" else "none"
 
         meta = ProcessingMetadata(
             versions_generated=sum(1 for v in versions if not v.is_original),
@@ -345,4 +350,7 @@ class ResultFusion:
             base += "；检测到高风险规避嫌疑，强制人工复核"
         elif consistency.evasion_level == "medium":
             base += "；检测到中风险规避嫌疑，优先人工复核"
+        # 分屏/屏中屏强制人工审核（原模型对缩小画面检测能力有限）
+        if "split_screen" in consistency.anomalies_detected:
+            base += "；检测到分屏/屏中屏特征，强制人工审核"
         return base
