@@ -71,13 +71,8 @@ class ResultFusion:
         # anomaly_score 用 calibrated_score 兜底（最准确的总体违规分）
         # 这与原 API 的契约一致：anomaly_score 反映总体违规程度，
         # category_scores 反映各类别分数，两者可以独立。
+        # 不一刀切强制提升 —— 基于还原版本信号动态调整
         fused_anomaly = self._fuse_anomaly_score(reports, final_scores, triggered_labels)
-
-        # 分屏/屏中屏强制提升：检测到分屏特征时，说明用户做了屏中屏规避
-        # 原模型对缩小画面的检测能力有限，即使还原后仍可能检测不到
-        # 此时强制将 anomaly_score 提升到 MEDIUM 等级（0.5），确保进入人工审核
-        if "split_screen" in consistency.anomalies_detected and fused_anomaly < 0.5:
-            fused_anomaly = 0.5
 
         threshold = self._get_threshold(original_detection)
         # predicted_categories：只基于 category_scores >= threshold
@@ -88,7 +83,7 @@ class ResultFusion:
 
         original_detection["category_scores"] = final_scores
         original_detection["anomaly_score"] = float(fused_anomaly)
-        # is_harmful 用 anomaly_score 判断（包含 calibrated_score 兜底 + 分屏强制提升）
+        # is_harmful 用 anomaly_score 判断（基于还原版本信号动态调整）
         original_detection["is_harmful"] = fused_anomaly >= threshold
         original_detection["predicted_categories"] = predicted_cats
 
@@ -204,25 +199,26 @@ class ResultFusion:
     def _fuse_anomaly_score(reports: List[dict | None],
                              final_scores: Dict[str, float],
                              triggered_labels: set = None) -> float:
-        """融合 anomaly_score：用 calibrated_score 兜底。
+        """融合 anomaly_score：基于还原版本信号动态调整。
 
         原 API 的契约：
         - anomaly_score：总体违规分（可能被推理增强校准过）
         - calibrated_score：推理增强后的校准分数（最准确）
         - category_scores：各类别分数（可能都低于阈值）
 
-        融合策略（与 category_scores 的严格策略不同，这里更宽松）：
+        融合策略（基于还原版本信号，无信号则不强行拔高）：
         1. 原始版本的 calibrated/anomaly score 始终纳入（保底）
-        2. 还原版本的 calibrated/anomaly score 在以下任一条件满足时纳入：
+        2. 还原版本在以下任一条件满足时纳入 calibrated/anomaly：
            a. 有触发跃升的标签（triggered_labels 非空）
            b. 还原版本 is_harmful=true（模型判定违规）
-           c. 还原版本 calibrated_score > 原始 calibrated_score + 0.1（显著提升）
-        3. 取融合后的 category_scores 最大值
-        4. 返回以上三者的最大值
+           c. 还原版本 calibrated_score > 原始 + 0.05（显著提升，阈值降低更敏感）
+           d. 还原版本某个 category_score > 原始对应类别 + 0.1（类别信号提升）
+        3. 还原版本带来的类别信号（max_cat_signal）也纳入 max
+        4. 返回 max(max_calibrated, max_anomaly, max_cat, max_cat_signal)
 
-        区别于 category_scores 的严格策略：
-        - category_scores 只在 flagged 时融合，避免类别污染
-        - anomaly_score 更宽松，避免漏检还原版本的真实违规信号
+        区别于一刀切强制 0.5：
+        - 无还原版本信号时，保留原始版本真实分数
+        - 有信号时，按信号强度动态提升
         """
         if triggered_labels is None:
             triggered_labels = set()
@@ -233,9 +229,17 @@ class ResultFusion:
         orig_detection = reports[0].get("detection") or reports[0]
         orig_calibrated = float(orig_detection.get("calibrated_score", 0.0))
         orig_anomaly = float(orig_detection.get("anomaly_score", 0.0))
+        # 原始版本的类别分数（归一化长短标签）
+        orig_scores_raw = orig_detection.get("category_scores") or {}
+        orig_cat: Dict[str, float] = {}
+        for key, val in orig_scores_raw.items():
+            short = LONG_LABEL_MAP.get(key, key)
+            if short in LABELS:
+                orig_cat[short] = float(val)
 
         max_calibrated = orig_calibrated
         max_anomaly = orig_anomaly
+        max_cat_signal = 0.0  # 还原版本带来的类别信号
 
         # 还原版本：检查是否带来显著的违规信号
         for i, r in enumerate(reports[1:], start=1):
@@ -245,19 +249,32 @@ class ResultFusion:
             restored_calibrated = float(detection.get("calibrated_score", 0.0))
             restored_anomaly = float(detection.get("anomaly_score", 0.0))
             restored_harmful = bool(detection.get("is_harmful", False))
+            restored_scores_raw = detection.get("category_scores") or {}
 
-            # 纳入条件：有触发跃升 / 还原版本违规 / 还原分数显著提升
+            # 检查是否有类别信号提升（某个类别在还原后显著高于原始）
+            cat_signal = False
+            for key, val in restored_scores_raw.items():
+                short = LONG_LABEL_MAP.get(key, key)
+                if short in LABELS:
+                    orig_v = orig_cat.get(short, 0.0)
+                    restored_v = float(val)
+                    if restored_v > orig_v + 0.1:  # 类别分数显著提升
+                        cat_signal = True
+                        max_cat_signal = max(max_cat_signal, restored_v)
+
+            # 纳入条件：有触发跃升 / 还原版本违规 / 还原分数显著提升 / 类别信号提升
             should_include = (
                 triggered_labels  # 有标签触发跃升
                 or restored_harmful  # 还原版本判定违规
-                or restored_calibrated > orig_calibrated + 0.1  # 显著提升
+                or restored_calibrated > orig_calibrated + 0.05  # 显著提升（阈值降低）
+                or cat_signal  # 类别信号提升
             )
             if should_include:
                 max_calibrated = max(max_calibrated, restored_calibrated)
                 max_anomaly = max(max_anomaly, restored_anomaly)
 
         max_cat = max(final_scores.values()) if final_scores else 0.0
-        return max(max_calibrated, max_anomaly, max_cat)
+        return max(max_calibrated, max_anomaly, max_cat, max_cat_signal)
 
     @staticmethod
     def _get_threshold(detection: dict) -> float:
