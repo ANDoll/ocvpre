@@ -2,7 +2,9 @@
 
 > Adversarial Evasion Detection Layer — 部署于 NSFW Detector 视频审核系统上游的独立中间模块。
 
-检测内容创作者常用的低成本规避手段（镜像翻转、边缘遮挡、画质降质、画面分屏、播放变速），通过「检测—过滤—变换还原—交叉验证—一致性度量」五段式机制识别并还原被刻意处理过的输入，将模型有效覆盖范围从「理想样本」扩展到「对抗样本」。
+检测内容创作者常用的低成本规避手段（镜像翻转、垂直翻转、边缘遮挡、画质降质、画面分屏/屏中屏、播放变速、暗光蒙版、闪烁插入帧），通过「检测—过滤—变换还原—交叉验证—一致性度量」五段式机制识别并还原被刻意处理过的输入，将模型有效覆盖范围从「理想样本」扩展到「对抗样本」。
+
+> **保险机制**：默认对所有视频追加 `mirror` / `vflip` / `brighten` 三类还原变换，由模块 D 通过分数对比判断是否真的存在规避，避免感知层漏检导致规避内容绕过。
 
 ---
 
@@ -29,7 +31,7 @@
 │      ↓                    │
 │  模块 B: 策略路由层          │  ← 决策表驱动 + 白名单
 │      ↓                    │
-│  模块 C: 变换还原层          │  ← 生成 1-3 个还原版本
+│  模块 C: 变换还原层          │  ← 生成最多 8 个还原版本
 │      ↓                    │
 │  调用原 /api/v1/detect     │  ← 原始+还原版本并行送审
 │      ↓                    │
@@ -272,10 +274,16 @@ if data.get("aedl_analysis"):
 | 检测项 | 方法 | 输出 |
 |--------|------|------|
 | 镜像对称性 | SSIM 比对水平翻转帧 | `is_mirror_suspicious` + `symmetry_score` |
+| 垂直翻转 | SSIM 比对垂直翻转帧（阈值 0.90） | `is_vertical_flip_suspicious` + `vertical_symmetry_score` |
 | 边缘遮挡 | 四边像素带方差 + 内缘梯度 | `is_border_occluded` + `border_width_ratio` |
 | 画质降质 | 拉普拉斯方差 + 压缩块效应 | `is_quality_degraded` + `laplacian_score` |
 | 分屏结构 | Canny + Hough 直线检测 | `is_split_screen` + `split_lines` |
+| 屏中屏检测 | 块方差分析（12×12 网格 + 形态学开运算 + 连通域）+ 轮廓检测 | `is_split_screen`（inset 模式）+ `split_lines`（2 垂直 + 2 水平边） |
 | 变速异常 | Farneback 光流（视觉通道） | `is_speed_abnormal` + `estimated_speed_ratio` |
+| 暗光蒙版 | 平均亮度低于 40 判定异常 | `is_darkened` + `mean_brightness` |
+| 闪烁插入帧 | 12 帧采样，帧间亮度突变 > 25 | `is_flickering` + `flicker_score` |
+
+> **屏中屏检测原理**：将灰度图划分为 12×12 块，计算每块方差；高方差区域（视频内容）被低方差区域（均匀背景）包围即判定为屏中屏。形态学开运算去除孤立噪声，连通组件分析定位窗口边界。配合 Canny+findContours 轮廓检测作为备选方案，覆盖软边缘和清晰边框两种场景。
 
 ### 模块 B：策略路由层（[strategy_router.py](aedl/strategy_router.py)）
 
@@ -284,33 +292,50 @@ if data.get("aedl_analysis"):
 | 检测到的异常 | 触发的变换 |
 |--------------|------------|
 | 镜像对称性异常 | 水平镜像还原（M） |
+| 垂直翻转异常 | 垂直镜像还原（V） |
 | 边缘遮挡 | 中心裁剪还原（C） |
 | 画质降质 | 亮度增强（B）+ 去噪（D）串联 |
 | 分屏结构 | 分屏主画面提取（S） |
+| 分屏/屏中屏 | 3 种组合变换链（见下文） |
+| 暗光蒙版 | 亮度增强（B） |
+| 闪烁插入帧 | 亮度增强（B） |
 | 帧率/变速异常 | 抽帧密度补偿（F） |
 | 多项叠加 | 按置信度选前 2 项串联 |
+| 保险机制 | 默认追加 `mirror` / `vflip` / `brighten`，所有视频均送审 |
 
-约束：最多生成 3 个还原版本，单链最多串联 2 项变换。命中白名单或低置信度时直接旁路。
+**分屏/屏中屏组合变换链**（每条都先提取窗口并放大到原始尺寸，再叠加不同图像增强）：
+
+1. `split_extract+brighten`：提取放大 + 亮度增强
+2. `split_extract+sharpen+brighten`：提取放大 + Unsharp Mask 锐化 + 亮度增强
+3. `split_extract+contrast+brighten`：提取放大 + CLAHE 对比度增强 + 亮度增强
+
+约束：最多生成 8 个还原版本（含原始共 9 版本），单链最多串联 2 项变换。命中白名单或低置信度时直接旁路。
 
 ### 模块 C：变换还原层（[transforms.py](aedl/transforms.py)）
 
 | 变换 | 操作 | 适用场景 |
 |------|------|----------|
 | 水平镜像 | `cv2.flip(frame, 1)` | 镜像规避还原 |
+| 垂直镜像 | `cv2.flip(frame, 0)` | 垂直翻转规避还原 |
 | 中心裁剪 | 动态裁剪比例 [0.80, 0.95] | 去除遮挡边框 |
-| 亮度增强 | Gamma(γ=0.8) + CLAHE | 还原暗光细节 |
+| 亮度增强 | Gamma(γ=0.8) + CLAHE | 还原暗光/蒙版细节 |
+| Unsharp Mask 锐化 | `addWeighted(原图×1.5, 模糊×-0.5)` | 增强放大画面的边缘细节 |
+| CLAHE 对比度增强 | LAB 空间 `clipLimit=4.0` | 让缩小画面的细节更突出 |
 | 轻量去噪 | 高斯 / fastNlMeans | 还原降质画面 |
 | 抽帧补偿 | 跳帧采样（零额外计算） | 变速视频 |
 | 分屏提取 | 按直线切割取最大子画面 | 多画面拼接 |
+| 屏中屏提取 | 2 垂直 + 2 水平边 → 提取中间矩形窗口 | 缩小有害画面嵌入无害背景 |
+| 提取后放大 | `cv2.resize` INTER_LANCZOS4 放大到原始尺寸 | 让模型看到的画面尺寸与正常视频一致 |
+| 组合变换 | `split_extract+{brighten/sharpen+brighten/contrast+brighten}` | 分屏/屏中屏多种增强组合，最大化检测率 |
 
 ### 模块 D：一致性校验层（[consistency.py](aedl/consistency.py)）
 
 对原始与还原版本的七维类别分数向量进行：
 
-1. **单标签跃升**：`Δ = P_restored(label) − P_original(label)`，Δ > 0.4 标记可疑
-2. **断崖式跃升**：Δ > 0.5 且 `P_restored > 0.7`，高度疑似
+1. **单标签跃升**：`Δ = P_restored(label) − P_original(label)`，Δ > 0.15 标记可疑
+2. **断崖式跃升**：Δ > 0.3 且 `P_restored > 0.5`，高度疑似
 3. **JSD 分布偏移**：Jensen-Shannon 散度 > 0.15 视为显著偏移
-4. **多视角投票**：任一还原版本 `P > 0.8` 触发标记
+4. **多视角投票**：任一还原版本 `P > 0.5` 触发标记
 5. **规避分加权**：
    ```
    EvasionScore = 0.35×max(Δ_label) + 0.25×mean(JSD)/ln(2)
@@ -328,7 +353,28 @@ if data.get("aedl_analysis"):
 
 ### 模块 E：结果融合输出（[fusion.py](aedl/fusion.py)）
 
-- **最终分数**：按标签维度取所有版本保守最大值
+采用**双融合策略**，平衡召回率与准确率：
+
+- **`category_scores`（严格融合）**：
+  - 类别分数的唯一来源是原 API 的 `category_scores` 字段
+  - `harmful_segments[].score` 和 `calibrated_score` 均不投影到标签
+  - 还原版本的分数只在「触发跃升」（`triggered_labels`）时才融合
+  - 避免裁剪后构图变化导致的模型误判污染最终结果（如血腥视频被误标为辱骂）
+
+- **`anomaly_score`（宽松融合，用 `calibrated_score` 兜底）**：
+  - 原始版本的 `calibrated/anomaly_score` 始终纳入（保底）
+  - 还原版本的分数在以下任一条件满足时纳入：
+    - 有触发跃升的标签（`triggered_labels` 非空）
+    - 还原版本 `is_harmful=true`（模型判定违规）
+    - 还原版本 `calibrated_score > 原始 + 0.1`（显著提升）
+  - 取所有纳入版本的 `max(calibrated, anomaly, max(category_scores))`
+
+- **`predicted_categories`**：只基于 `category_scores >= 0.5`，不继承原 API 的 `predicted_categories` 误判
+
+- **分屏/屏中屏强制机制**（原模型对缩小画面检测能力有限）：
+  - 检测到 `split_screen` 异常时，强制将 `anomaly_score` 提升到 0.5（MEDIUM 等级），确保进入人工审核
+  - 检测到 `split_screen` 异常时，强制 `needs_manual_review=true` 且 `priority=high`，不依赖原模型判断
+
 - **证据链**：输出跃升幅度最大的标签及对应变换
 - **透传原始报告**：保留原 `/api/v1/detect` 完整响应供前端使用
 
@@ -373,12 +419,12 @@ if data.get("aedl_analysis"):
 |------|------|
 | 模块 A 输入感知 | < 50ms |
 | 模块 B 策略路由 | < 1ms |
-| 模块 C 变换还原 | 200-500ms / 版本 |
+| 模块 C 变换还原 | 200-500ms / 版本（最多 8 版本） |
 | 后端模型推理 | 取决于原模型（并行后取 max） |
 | 模块 D 一致性校验 | < 1ms |
 | 模块 E 结果融合 | < 1ms |
 
-仅 10%-15% 视频触发完整流程，整体模型推理量增幅约 30%。
+由于采用保险机制（默认追加 `mirror`/`vflip`/`brighten`）+ 分屏组合变换链，触发完整流程的视频会增加模型推理量。保险机制可按需在 [configs/aedl.yaml](configs/aedl.yaml) 中通过 `router.force_restore_transforms` 调整。
 
 ---
 
@@ -387,3 +433,6 @@ if data.get("aedl_analysis"):
 | 日期 | 变更 |
 |------|------|
 | 2026-06-28 | 初版：实现方案一完整五段式架构，含 A/B/C/D/E 五模块与 FastAPI 服务入口 |
+| 2026-06-28 | 新增垂直翻转、暗光蒙版、闪烁插入帧检测；启用保险机制（`mirror`/`vflip`/`brighten` 默认送审）；`max_restored_versions` 提升至 8 |
+| 2026-06-28 | 新增屏中屏检测（块方差分析 + 形态学开运算 + 连通域 + 轮廓检测备选）；分屏提取后放大到原始尺寸（INTER_LANCZOS4）；新增 `_sharpen`（Unsharp Mask）与 `_contrast`（CLAHE `clipLimit=4.0`）变换；3 种分屏组合变换链 |
+| 2026-06-28 | 双融合策略：`category_scores` 严格融合（仅 `triggered_labels`），`anomaly_score` 宽松融合（含 `is_harmful` / `calibrated` 显著提升条件）；分屏强制 `anomaly_score >= 0.5` 且强制人工审核；`predicted_categories` 改为基于 `category_scores >= 0.5`，不继承原 API 误判；阈值下调 `label_jump_threshold: 0.4→0.15`、`label_cliff_threshold: 0.5→0.3`、`restored_high_confidence: 0.8→0.5` |
