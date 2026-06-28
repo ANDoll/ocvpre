@@ -329,18 +329,17 @@ class InputPerception:
             maxLineGap=20,
         )
         candidate_lines: List[SplitLine] = []
-        if lines is None:
-            return False, candidate_lines, 0
-        for ln in lines[:, 0]:
-            x1, y1, x2, y2 = ln
-            length = np.hypot(x2 - x1, y2 - y1)
-            if length < min(w, h) * self.cfg.split_line_min_ratio:
-                continue
-            if abs(x1 - x2) < 2:           # 近似垂直
-                candidate_lines.append(SplitLine(position=float(x1) / w, orientation="vertical"))
-            elif abs(y1 - y2) < 2:         # 近似水平
-                candidate_lines.append(SplitLine(position=float(y1) / h, orientation="horizontal"))
-        candidate_lines = self._dedupe_lines(candidate_lines)
+        if lines is not None:
+            for ln in lines[:, 0]:
+                x1, y1, x2, y2 = ln
+                length = np.hypot(x2 - x1, y2 - y1)
+                if length < min(w, h) * self.cfg.split_line_min_ratio:
+                    continue
+                if abs(x1 - x2) < 2:           # 近似垂直
+                    candidate_lines.append(SplitLine(position=float(x1) / w, orientation="vertical"))
+                elif abs(y1 - y2) < 2:         # 近似水平
+                    candidate_lines.append(SplitLine(position=float(y1) / h, orientation="horizontal"))
+            candidate_lines = self._dedupe_lines(candidate_lines)
 
         # 验证：分割线两侧区域必须有显著内容差异（颜色直方图距离）
         confirmed: List[SplitLine] = []
@@ -361,39 +360,138 @@ class InputPerception:
     def _detect_inset_screen(self, frame: np.ndarray, w: int, h: int) -> List[SplitLine]:
         """屏中屏检测：检测画面中小窗口（缩小有害画面嵌入无害背景）。
 
-        方法：
-        1. 用 Canny + findContours 找轮廓
-        2. 筛选面积适中（10%-70%画面）的矩形轮廓
-        3. 验证矩形内部与外部内容差异显著
-        4. 返回矩形的 4 条边作为分割线
+        方法 1（块方差分析）：
+        将画面分成 NxN 网格，计算每块的标准差。
+        屏中屏特征：中间区域高方差（视频内容），四周低方差（均匀背景）。
+        找到高方差区域的 bounding box 作为屏中屏位置。
+
+        方法 2（轮廓检测，作为备选）：
+        Canny + findContours 找矩形轮廓，验证内部/外部内容差异。
+        适用于有清晰边框的屏中屏。
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 方法 1：块方差分析（对软边缘屏中屏最有效）
+        inset = self._find_inset_by_variance(gray, w, h)
+        if inset:
+            return inset
+
+        # 方法 2：轮廓检测（对清晰边框屏中屏有效）
+        inset = self._find_inset_by_contour(gray, w, h)
+        if inset:
+            return inset
+
+        return []
+
+    def _find_inset_by_variance(self, gray: np.ndarray, w: int, h: int) -> List[SplitLine]:
+        """块方差分析法检测屏中屏。"""
+        # 12x12 网格，更精细
+        gh, gw = 12, 12
+        bh, bw = h // gh, w // gw
+        if bh < 10 or bw < 10:
+            return []
+
+        # 计算每块的标准差
+        std_map = np.zeros((gh, gw), dtype=np.float32)
+        for i in range(gh):
+            for j in range(gw):
+                block = gray[i*bh:(i+1)*bh, j*bw:(j+1)*bw]
+                std_map[i, j] = float(block.std())
+
+        # 自适应阈值：整体方差的 0.5 倍，最低 8.0
+        global_std = float(gray.std())
+        threshold = max(global_std * 0.5, 8.0)
+
+        # 二值化：高方差块为 1（有内容），低方差块为 0（背景）
+        binary = (std_map > threshold).astype(np.uint8)
+
+        # 形态学开运算（erosion + dilation）去除孤立噪声
+        # 用 3x3 核做开运算，需要至少 3x3 的连通区域才能保留
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+        # 再次膨胀，连接近邻的高方差块
+        binary = cv2.dilate(binary, kernel, iterations=1)
+
+        # 找最大连通组件（避免多个小区域干扰）
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        if num_labels <= 1:
+            return []
+
+        # 找面积最大的非背景组件（label 0 是背景）
+        max_area = 0
+        max_label = 0
+        for label in range(1, num_labels):
+            area = stats[label, cv2.CC_STAT_AREA]
+            if area > max_area:
+                max_area = area
+                max_label = label
+
+        if max_label == 0 or max_area < 9:  # 至少 3x3 = 9 块
+            return []
+
+        # 只保留最大连通组件
+        binary = (labels == max_label).astype(np.uint8)
+
+        # 找 bounding box
+        rows = np.any(binary, axis=1)
+        cols = np.any(binary, axis=0)
+        r_min, r_max = np.where(rows)[0][[0, -1]]
+        c_min, c_max = np.where(cols)[0][[0, -1]]
+
+        # 转换为像素坐标
+        x1 = int(c_min * bw)
+        y1 = int(r_min * bh)
+        x2 = int((c_max + 1) * bw)
+        y2 = int((r_max + 1) * bh)
+        cw = x2 - x1
+        ch = y2 - y1
+
+        # 面积筛选：5%-70% 画面
+        area_ratio = (cw * ch) / (w * h)
+        if area_ratio < 0.05 or area_ratio > 0.7:
+            return []
+
+        # 内部方差必须显著高于边缘带
+        margin_blocks = 2
+        top_bg = std_map[:margin_blocks, :].mean()
+        bottom_bg = std_map[-margin_blocks:, :].mean()
+        left_bg = std_map[:, :margin_blocks].mean()
+        right_bg = std_map[:, -margin_blocks:].mean()
+        inner_std = std_map[r_min:r_max+1, c_min:c_max+1].mean()
+        bg_min = min(top_bg, bottom_bg, left_bg, right_bg)
+        if inner_std < bg_min * 2.0 or inner_std < 10.0:
+            return []
+
+        return [
+            SplitLine(position=float(x1) / w, orientation="vertical"),
+            SplitLine(position=float(x2) / w, orientation="vertical"),
+            SplitLine(position=float(y1) / h, orientation="horizontal"),
+            SplitLine(position=float(y2) / h, orientation="horizontal"),
+        ]
+
+    def _find_inset_by_contour(self, gray: np.ndarray, w: int, h: int) -> List[SplitLine]:
+        """轮廓检测法（备选）：用 Canny + findContours 找矩形窗口。"""
         edges = cv2.Canny(gray, 30, 100)
-        # 形态学闭运算连接断裂的边缘
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         img_area = w * h
-        # 按面积降序，最多检查前 10 个轮廓
         contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < img_area * 0.05 or area > img_area * 0.7:
                 continue
-            # 多边形逼近，找矩形
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
             if len(approx) != 4:
                 continue
-            # 获取矩形边界
             x, y, cw, ch = cv2.boundingRect(approx)
             if cw < w * 0.15 or ch < h * 0.15:
                 continue
-            # 验证内部与外部内容差异
             if self._inset_differs(gray, x, y, cw, ch, w, h):
-                # 返回 4 条边作为分割线
                 return [
                     SplitLine(position=float(x) / w, orientation="vertical"),
                     SplitLine(position=float(x + cw) / w, orientation="vertical"),
