@@ -67,18 +67,23 @@ class TransformRestorer:
         crop_rect = None
         split_regions = None
         resample_ratio = 1.0
+        # split_extract 后是否放大到原始尺寸
+        split_resize_to_original = False
 
         for spec in chain:
             if spec.name == "center_crop":
                 ratio = spec.params.get("ratio", self.cfg.center_crop_default)
                 crop_rect = self._compute_crop_rect(w, h, ratio)
                 out_w, out_h = crop_rect[2], crop_rect[3]
-            elif spec.name == "split_extract" or spec.name == "split_extract+brighten":
+            elif spec.name == "split_extract" or spec.name == "split_extract+brighten" \
+                 or spec.name == "split_extract+sharpen+brighten" or spec.name == "split_extract+contrast+brighten":
                 split_regions = self._compute_split_regions(w, h, spec.params.get("lines", []))
                 if split_regions:
-                    # 取最大子画面
-                    r0 = max(split_regions, key=lambda r: r[2] * r[3])
-                    out_w, out_h = r0[2], r0[3]
+                    # 提取后放大到原始尺寸，让模型看到的画面尺寸和正常视频一致
+                    # 这样模型能更好地识别放大的有害画面
+                    split_resize_to_original = True
+                    # 输出尺寸保持原始尺寸
+                    out_w, out_h = w, h
             elif spec.name == "resample":
                 resample_ratio = spec.params.get("ratio", 1.0)
 
@@ -108,7 +113,7 @@ class TransformRestorer:
                     frame_idx += 1
                     continue
                 for spec in chain:
-                    frame = self._apply_one(frame, spec, crop_rect, split_regions)
+                    frame = self._apply_one(frame, spec, crop_rect, split_regions, w, h)
                     if frame is None or frame.size == 0:
                         break
                 # 加速还原：每帧重复写入 repeat_count 次
@@ -122,7 +127,7 @@ class TransformRestorer:
         return out_path
 
     def _apply_one(self, frame: np.ndarray, spec: TransformSpec,
-                   crop_rect, split_regions) -> np.ndarray:
+                   crop_rect, split_regions, orig_w: int = 0, orig_h: int = 0) -> np.ndarray:
         """对单帧执行单个变换。"""
         if spec.name == "mirror":
             return cv2.flip(frame, 1)
@@ -133,14 +138,38 @@ class TransformRestorer:
             return frame[y:y + h, x:x + w]
         if spec.name == "brighten":
             return self._brighten(frame)
+        if spec.name == "sharpen":
+            return self._sharpen(frame)
+        if spec.name == "contrast":
+            return self._contrast(frame)
         if spec.name == "denoise":
             use_g = spec.params.get("use_gaussian", True)
             return self._denoise(frame, use_g)
         if spec.name == "split_extract":
-            return self._extract_main_region(frame, split_regions)
-        if spec.name == "split_extract+brighten":
-            # 组合变换：先提取窗口，再增强亮度
             extracted = self._extract_main_region(frame, split_regions)
+            # 放大到原始尺寸，让模型看到的画面尺寸和正常视频一致
+            if orig_w > 0 and orig_h > 0 and extracted.shape[:2] != (orig_h, orig_w):
+                extracted = cv2.resize(extracted, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+            return extracted
+        if spec.name == "split_extract+brighten":
+            # 组合变换：先提取窗口放大，再增强亮度
+            extracted = self._extract_main_region(frame, split_regions)
+            if orig_w > 0 and orig_h > 0 and extracted.shape[:2] != (orig_h, orig_w):
+                extracted = cv2.resize(extracted, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+            return self._brighten(extracted)
+        if spec.name == "split_extract+sharpen+brighten":
+            # 组合变换：提取窗口放大 → 锐化 → 亮度增强
+            extracted = self._extract_main_region(frame, split_regions)
+            if orig_w > 0 and orig_h > 0 and extracted.shape[:2] != (orig_h, orig_w):
+                extracted = cv2.resize(extracted, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+            extracted = self._sharpen(extracted)
+            return self._brighten(extracted)
+        if spec.name == "split_extract+contrast+brighten":
+            # 组合变换：提取窗口放大 → 对比度增强 → 亮度增强
+            extracted = self._extract_main_region(frame, split_regions)
+            if orig_w > 0 and orig_h > 0 and extracted.shape[:2] != (orig_h, orig_w):
+                extracted = cv2.resize(extracted, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
+            extracted = self._contrast(extracted)
             return self._brighten(extracted)
         if spec.name == "resample":
             return frame  # 抽帧在 _apply_chain 中处理
@@ -187,6 +216,35 @@ class TransformRestorer:
 
     # ─────────────── C.5 抽帧密度补偿 ───────────────
     # 见 _apply_chain 中的跳帧逻辑
+
+    # ─────────────── C.7 锐化（Unsharp Mask） ───────────────
+
+    @staticmethod
+    def _sharpen(frame: np.ndarray) -> np.ndarray:
+        """Unsharp Mask 锐化：增强边缘细节，让放大的画面更清晰。
+
+        原理：原图 - 高斯模糊 = 高频细节，原图 + 细节 = 锐化图
+        """
+        gaussian = cv2.GaussianBlur(frame, (0, 0), 3)
+        # 锐化强度：原图 * 1.5 - 模糊 * 0.5
+        return cv2.addWeighted(frame, 1.5, gaussian, -0.5, 0)
+
+    # ─────────────── C.8 对比度增强 ───────────────
+
+    @staticmethod
+    def _contrast(frame: np.ndarray) -> np.ndarray:
+        """对比度增强：CLAHE 在 LAB 空间增强对比度。
+
+        比 _brighten 更强的对比度增强，不改变整体亮度，
+        只增强局部对比度，让画面细节更清晰。
+        """
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        # 更高的 clipLimit 增强局部对比度
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
     # ─────────────── C.6 分屏主画面提取 ───────────────
 

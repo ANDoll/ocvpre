@@ -25,7 +25,7 @@ perception:
   flicker_brightness_threshold: 25.0
 
 router:
-  max_restored_versions: 6
+  max_restored_versions: 8
   max_transform_chain: 2
   min_confidence_to_trigger: 0.3
   whitelist_enabled: true
@@ -50,9 +50,9 @@ transform:
   split_subarea_min_ratio: 0.5
 
 consistency:
-  label_jump_threshold: 0.4
-  label_cliff_threshold: 0.5
-  restored_high_confidence: 0.8
+  label_jump_threshold: 0.15
+  label_cliff_threshold: 0.3
+  restored_high_confidence: 0.5
   jsd_threshold: 0.15
   evasion_weights: [0.35, 0.25, 0.25, 0.15]
   high_risk_threshold: 0.7

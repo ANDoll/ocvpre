@@ -39,7 +39,7 @@ class PerceptionConfig:
 @dataclass
 class RouterConfig:
     """模块 B 阈值"""
-    max_restored_versions: int = 6            # 含原始共最多 7 版本（支持分屏组合变换）
+    max_restored_versions: int = 8            # 含原始共最多 9 版本（支持分屏多组合变换）
     max_transform_chain: int = 2              # 单变换链最多串联 2 项
     min_confidence_to_trigger: float = 0.3    # 低于此值不触发变换
     whitelist_enabled: bool = True
@@ -68,9 +68,9 @@ class TransformConfig:
 @dataclass
 class ConsistencyConfig:
     """模块 D 阈值"""
-    label_jump_threshold: float = 0.4         # 单标签跃升阈值
-    label_cliff_threshold: float = 0.5         # 断崖式跃升阈值
-    restored_high_confidence: float = 0.8     # 还原后高置信触发线
+    label_jump_threshold: float = 0.15        # 单标签跃升阈值（降低让还原提升更容易触发）
+    label_cliff_threshold: float = 0.3         # 断崖式跃升阈值
+    restored_high_confidence: float = 0.5     # 还原后高置信触发线（降低让更多还原版本纳入）
     jsd_threshold: float = 0.15                # JSD 分布偏移阈值
     evasion_weights: tuple = (0.35, 0.25, 0.25, 0.15)  # w1,w2,w3,w4
     high_risk_threshold: float = 0.7

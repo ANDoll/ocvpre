@@ -72,6 +72,13 @@ class ResultFusion:
         # 这与原 API 的契约一致：anomaly_score 反映总体违规程度，
         # category_scores 反映各类别分数，两者可以独立。
         fused_anomaly = self._fuse_anomaly_score(reports, final_scores, triggered_labels)
+
+        # 分屏/屏中屏强制提升：检测到分屏特征时，说明用户做了屏中屏规避
+        # 原模型对缩小画面的检测能力有限，即使还原后仍可能检测不到
+        # 此时强制将 anomaly_score 提升到 MEDIUM 等级（0.5），确保进入人工审核
+        if "split_screen" in consistency.anomalies_detected and fused_anomaly < 0.5:
+            fused_anomaly = 0.5
+
         threshold = self._get_threshold(original_detection)
         # predicted_categories：只基于 category_scores >= threshold
         # 这是唯一安全的方案 —— 不继承原 API 的 predicted_categories 误判
@@ -81,7 +88,7 @@ class ResultFusion:
 
         original_detection["category_scores"] = final_scores
         original_detection["anomaly_score"] = float(fused_anomaly)
-        # is_harmful 用 anomaly_score 判断（包含 calibrated_score 兜底）
+        # is_harmful 用 anomaly_score 判断（包含 calibrated_score 兜底 + 分屏强制提升）
         original_detection["is_harmful"] = fused_anomaly >= threshold
         original_detection["predicted_categories"] = predicted_cats
 
