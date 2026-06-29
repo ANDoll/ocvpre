@@ -12,23 +12,9 @@
 
 - **零数据增强**：仅基于 OpenCV / NumPy 传统 CV 算子，不依赖标注数据，不引入模型训练
 - **模型无关性**：作为独立预处理模块，与下游审核模型完全解耦，可复用
-- **保守召回策略**：任一还原版本揭示的违规信号均不会被遗漏；遵循"宁可误报也不放过"原则
+- **保守召回策略**：任一还原版本揭示的违规信号均不会被遗漏
 - **可解释证据链**：输出具体规避类型与量化证据，支撑人工复核
 - **吞吐量可控**：快速通道优先，仅 10%-15% 视频触发完整流程
-
----
-
-## 重点攻坚：屏中屏规避
-
-**攻坚对象的选取依据**：实测发现，镜像翻转、调亮/调暗画面、加边框遮挡这一类常规人为作弊手段对原审核模型的影响有限——原模型基本仍能识别。但**屏中屏规避（将有害画面缩小后嵌入无害背景）对原模型造成了显著且严重的检测能力下降**，原模型对缩小画面的识别几乎失效（分数从安全区直接跌入低分区）。因此，AEDL 将屏中屏作为重点攻克问题，在感知、变换、融合三个层面均设计了专项机制。
-
-### 原模型的固有局限
-
-经分析原 NSFW Detector 模型推理代码，发现关键事实：
-
-> 原模型在 `anomaly_score >= 0.5`（is_harmful=true）时触发 **CLIP re-rank**，用纯 CLIP 文本特征重新计算 `category_scores`，覆盖 SVLA logits2 的偏置分配；而当 `anomaly_score < 0.5` 时**不触发 re-rank**，`category_scores` 保留 logits2 偏置。
-
-屏中屏视频的所有版本（原始+还原）`anomaly_score` 普遍低于 0.5，均未触发原模型 re-rank，因此 `category_scores` 不可靠——真实类别涨幅小，误报类别涨幅反而最大。这是 AEDL 最终版引入 CLIP re-rank + 按涨幅精准放大的根本动因。
 
 ---
 
@@ -43,17 +29,15 @@
 │                            │
 │  模块 A: 输入感知层          │  ← 快速 CV 算子，<50ms
 │      ↓                    │
-│  模块 B: 策略路由层          │  ← 决策表驱动 + 白名单 + 保险机制
+│  模块 B: 策略路由层          │  ← 决策表驱动 + 白名单
 │      ↓                    │
 │  模块 C: 变换还原层          │  ← 生成最多 8 个还原版本
 │      ↓                    │
 │  调用原 /api/v1/detect     │  ← 原始+还原版本并行送审
 │      ↓                    │
-│  CLIP re-rank (屏中屏专属)  │  ← AEDL 侧自做 CLIP re-rank
-│      ↓                    │
 │  模块 D: 一致性校验层        │  ← JSD / 单标签跃升 / 规避分
 │      ↓                    │
-│  模块 E: 结果融合输出        │  ← 双融合策略 + 按涨幅精准放大
+│  模块 E: 结果融合输出        │  ← 保守最大值 + 证据链
 └────────────────────────────┘
        │
        ▼
@@ -78,7 +62,6 @@ nsfw/
 │   ├── backend_client.py      # 后端客户端（调用原 API）
 │   ├── consistency.py         # 模块 D：一致性校验层
 │   ├── fusion.py              # 模块 E：结果融合输出
-│   ├── clip_rerank.py         # CLIP re-rank 模块（屏中屏专属）
 │   ├── pipeline.py            # 主流程编排
 │   ├── server.py              # FastAPI 服务入口
 │   └── requirements.txt       # 依赖清单
@@ -97,7 +80,6 @@ nsfw/
 
 - Python 3.10+
 - 后端已运行 NSFW Detector 服务（默认 `http://localhost:8000`）
-- CLIP re-rank 需要访问网页模型 `D:/nsfwtest/NFSW_Detector/clip` 包
 
 ### 步骤
 
@@ -107,7 +89,6 @@ pip install -r aedl/requirements.txt
 
 # 2.（可选）编辑配置
 # 修改 configs/aedl.yaml 中的 backend.base_url 指向你的 NSFW Detector 服务
-# 修改 clip_rerank.clip_module_path 指向网页模型 clip 包路径
 
 # 3. 启动 AEDL 服务
 python -m aedl.server
@@ -297,17 +278,12 @@ if data.get("aedl_analysis"):
 | 边缘遮挡 | 四边像素带方差 + 内缘梯度 | `is_border_occluded` + `border_width_ratio` |
 | 画质降质 | 拉普拉斯方差 + 压缩块效应 | `is_quality_degraded` + `laplacian_score` |
 | 分屏结构 | Canny + Hough 直线检测 | `is_split_screen` + `split_lines` |
-| 屏中屏检测（方差法） | 12×12 网格块方差 + 形态学开运算 + 连通域 | `is_split_screen`（inset 模式）+ 4 条边线 |
-| 屏中屏检测（轮廓法） | Canny + findContours 矩形轮廓 | 同上（备选） |
-| 屏中屏检测（帧差法） | 多帧累加差异，定位动态窗口 | 同上（动态窗口兜底） |
+| 屏中屏检测 | 块方差分析（12×12 网格 + 形态学开运算 + 连通域）+ 轮廓检测 | `is_split_screen`（inset 模式）+ `split_lines`（2 垂直 + 2 水平边） |
 | 变速异常 | Farneback 光流（视觉通道） | `is_speed_abnormal` + `estimated_speed_ratio` |
 | 暗光蒙版 | 平均亮度低于 40 判定异常 | `is_darkened` + `mean_brightness` |
 | 闪烁插入帧 | 12 帧采样，帧间亮度突变 > 25 | `is_flickering` + `flicker_score` |
 
-> **屏中屏检测原理**：
-> - **方差法**：将灰度图划分为 12×12 块，计算每块方差；高方差区域（视频内容）被低方差区域（均匀背景）包围即判定为屏中屏。形态学开运算去除孤立噪声，连通组件分析定位窗口边界。
-> - **轮廓法**：Canny 边缘 + findContours 找矩形轮廓，适用于清晰边框屏中屏。
-> - **帧差法**：采样多帧累加相邻帧差异，静态背景无差异而动态窗口高差异，适用于动态窗口的兜底检测。
+> **屏中屏检测原理**：将灰度图划分为 12×12 块，计算每块方差；高方差区域（视频内容）被低方差区域（均匀背景）包围即判定为屏中屏。形态学开运算去除孤立噪声，连通组件分析定位窗口边界。配合 Canny+findContours 轮廓检测作为备选方案，覆盖软边缘和清晰边框两种场景。
 
 ### 模块 B：策略路由层（[strategy_router.py](aedl/strategy_router.py)）
 
@@ -352,22 +328,6 @@ if data.get("aedl_analysis"):
 | 提取后放大 | `cv2.resize` INTER_LANCZOS4 放大到原始尺寸 | 让模型看到的画面尺寸与正常视频一致 |
 | 组合变换 | `split_extract+{brighten/sharpen+brighten/contrast+brighten}` | 分屏/屏中屏多种增强组合，最大化检测率 |
 
-### CLIP re-rank 模块（[clip_rerank.py](aedl/clip_rerank.py)）— 屏中屏专属
-
-**问题背景**：原 NSFW Detector 模型在 `anomaly_score < 0.5` 时不触发 CLIP re-rank，`category_scores` 基于 SVLA logits2 的条件概率分配存在偏置。屏中屏视频的所有版本 `anomaly_score` 普遍低于 0.5，因此类别分数不可靠。
-
-**解决方案**：AEDL 侧自做 CLIP re-rank，复用网页模型的 CLIP ViT-B/16 与 7 类文本 prompts：
-
-1. 对屏中屏模式下所有 `anomaly_score < 0.5` 的版本，AEDL 自行抽帧（8 帧均匀采样）
-2. 提取 CLIP 视觉特征，与 7 类文本特征计算相似度
-3. 取 top-k 帧相似度平均，`category_scores[cat] = anomaly_score × max(0, topk_sim)`
-4. 用纯 CLIP 信号覆盖 SVLA logits2 偏置，获得更准确的类别分数
-
-**容错设计**：
-- 单例模式，CLIP 模型只加载一次，避免重复加载开销
-- 延迟加载，避免服务启动时加载 CLIP 模型
-- CLIP 加载失败时自动降级为纯"按涨幅精准放大"方案，不影响整体可用性
-
 ### 模块 D：一致性校验层（[consistency.py](aedl/consistency.py)）
 
 对原始与还原版本的七维类别分数向量进行：
@@ -395,124 +355,34 @@ if data.get("aedl_analysis"):
 
 采用**双融合策略**，平衡召回率与准确率：
 
-#### E.1 `category_scores` 融合
+- **`category_scores`（严格融合）**：
+  - 类别分数的唯一来源是原 API 的 `category_scores` 字段
+  - `harmful_segments[].score` 和 `calibrated_score` 均不投影到标签
+  - 还原版本的分数只在「触发跃升」（`triggered_labels`）时才融合
+  - 避免裁剪后构图变化导致的模型误判污染最终结果（如血腥视频被误标为辱骂）
 
-**普通模式（严格融合）**：
-- 类别分数的唯一来源是原 API 的 `category_scores` 字段
-- `harmful_segments[].score` 和 `calibrated_score` 均不投影到标签（避免误判放大）
-- 还原版本的分数只在「触发跃升」（`triggered_labels`）时才融合
-- 避免裁剪后构图变化导致的模型误判污染最终结果
+- **`anomaly_score`（宽松融合，用 `calibrated_score` 兜底）**：
+  - 原始版本的 `calibrated/anomaly_score` 始终纳入（保底）
+  - 还原版本的分数在以下任一条件满足时纳入：
+    - 有触发跃升的标签（`triggered_labels` 非空）
+    - 还原版本 `is_harmful=true`（模型判定违规）
+    - 还原版本 `calibrated_score > 原始 + 0.1`（显著提升）
+  - 取所有纳入版本的 `max(calibrated, anomaly, max(category_scores))`
 
-**屏中屏模式（按涨幅精准放大）**：
-- 对每个类别，找到还原版本中的最高分 `max_restored`
-- 计算真实涨跌倍数 `ratio = max_restored / original`（不封顶）
-- 根据 ratio 决定放大系数（涨得越多 → 系数越大）：
+- **`predicted_categories`**：只基于 `category_scores >= 0.5`，不继承原 API 的 `predicted_categories` 误判
 
-  | 涨跌倍数 | 放大系数 | 信号强度 |
-  |---------|---------|---------|
-  | ratio > 200 | ×25 | 极强信号（如从 0.0001 涨到 0.025+，380 倍） |
-  | ratio > 50 | ×20 | 强信号 |
-  | ratio > 10 | ×10 | 中强信号 |
-  | ratio > 3 | ×5 | 中等信号 |
-  | ratio > 1.5 | ×2 | 弱信号 |
-  | ratio ≤ 1.5 | ×1 | 不放大 |
+- **分屏/屏中屏强制机制**（原模型对缩小画面检测能力有限）：
+  - 检测到 `split_screen` 异常时，强制将 `anomaly_score` 提升到 0.5（MEDIUM 等级），确保进入人工审核
+  - 检测到 `split_screen` 异常时，强制 `needs_manual_review=true` 且 `priority=high`，不依赖原模型判断
 
-- `final_score = min(max_restored × boost, 1.0)`
-- 涨得少不放大，避免误判（如 Blood 涨 1.4 倍 → 不放大，避免误判为血腥）
-
-> **设计依据**：还原版本的真实分数是模型实际输出（不是构造的），放大系数只是"增强已检测到的信号"，不是无中生有。
-
-#### E.2 `anomaly_score` 融合（宽松，用 `calibrated_score` 兜底）
-
-基于还原版本信号动态调整，无信号则不强行拔高：
-
-1. 原始版本的 `calibrated/anomaly_score` 始终纳入（保底）
-2. 还原版本在以下任一条件满足时纳入 `calibrated/anomaly`：
-   - 有触发跃升的标签（`triggered_labels` 非空）
-   - 还原版本 `is_harmful=true`（模型判定违规）
-   - 还原版本 `calibrated_score > 原始 + 0.05`（显著提升）
-   - 类别信号提升：某类别绝对提升 > 0.03 或相对提升 > 3 倍
-   - ood 信号：还原版本 `ood_score > 0.3` 且 > 原始 + 0.2
-3. 返回所有纳入信号的最大值
-
-#### E.3 `predicted_categories`
-
-只基于 `category_scores >= 0.5`，不继承原 API 的 `predicted_categories` 误判。
-
-#### E.4 分屏/屏中屏强制人工审核
-
-检测到 `split_screen` 异常时：
-- 强制 `needs_manual_review=true` 且 `priority=high`
-- 不依赖原模型判断（原模型对缩小画面检测能力有限）
-- 处置建议追加"检测到分屏/屏中屏特征，强制人工审核"
-
-#### E.5 证据链
-
-输出跃升幅度最大的标签及对应变换，支撑人工复核决策。
-
-#### E.6 透传原始报告
-
-保留原 `/api/v1/detect` 完整响应供前端使用。
-
----
-
-## 最终版方案：CLIP re-rank + 按涨幅精准放大
-
-### 设计动机
-
-经分析原模型推理代码发现：原模型在 `anomaly_score < 0.5` 时不触发 CLIP re-rank，`category_scores` 保留 SVLA logits2 偏置。屏中屏视频的所有版本 `anomaly_score` 普遍低于 0.5，均未触发原模型 re-rank，因此 `category_scores` 不可靠。简单的"按涨幅放大"会放大误报而非真实信号。
-
-### 两层机制叠加
-
-```
-原 API 输出（SVLA logits2 偏置，低分区间不准）
-    ↓
-CLIP re-rank（纯 CLIP 信号，修正低分区间的类别偏置）
-    ↓
-按涨幅精准放大（涨得多的类别 × 25，涨得少的不放大）
-    ↓
-最终 category_scores → anomaly_score → is_harmful
-```
-
-### 选择依据
-
-基于**"宁可误报也不放过"**原则，最终版相比中间版本的优势：
-
-| 维度 | 中间版本（强制机制） | 最终版（CLIP re-rank + 涨幅放大） |
-|------|------------------|--------|
-| 暴力屏中屏 | 依赖感知层检测，能识别 | CLIP re-rank 修正类别 + 涨幅放大，能识别 |
-| 金钱欺诈屏中屏 | 感知层漏检则完全失效 | CLIP re-rank 不依赖单次检测，能识别 |
-| 类别准确性 | 不区分信号，无类别 | CLIP re-rank 提供更准类别 |
-| 可解释性 | 一刀切 0.5，无证据 | 基于真实涨幅放大，有证据链 |
-| 召回率 | 依赖感知层，有漏检风险 | 双层兜底，召回率最大化 |
-
-最终版在暴力与金钱欺诈两类屏中屏样本上均能突破 0.5 阈值判为有害，虽类别标签可能存在误报（因原模型对屏中屏内容的固有识别局限），但确保了**不放过任何违规内容**的核心目标。类别精准度的进一步提升属于原模型优化的范畴，超出 AEDL 的能力边界。
+- **证据链**：输出跃升幅度最大的标签及对应变换
+- **透传原始报告**：保留原 `/api/v1/detect` 完整响应供前端使用
 
 ---
 
 ## 配置
 
-主配置文件 [configs/aedl.yaml](configs/aedl.yaml) 集中管理所有阈值：
-
-```yaml
-# 关键配置项摘录
-router:
-  max_restored_versions: 8
-  force_restore_transforms: [mirror, vflip, brighten]
-
-consistency:
-  label_jump_threshold: 0.15      # 单标签跃升阈值
-  label_cliff_threshold: 0.3      # 断崖式跃升阈值
-  restored_high_confidence: 0.5   # 还原后高置信触发线
-
-clip_rerank:
-  enabled: true
-  clip_variant: "ViT-B/16"
-  clip_module_path: "D:/nsfwtest/NFSW_Detector/clip"
-  num_frames: 8
-  topk_frames: 3
-  batch_size: 8
-```
+主配置文件 [configs/aedl.yaml](configs/aedl.yaml) 集中管理所有阈值，对应方案文档「六、关键参数与阈值汇总」。
 
 支持环境变量覆盖：
 
@@ -536,10 +406,8 @@ clip_rerank:
 | numpy | 数值计算与向量操作 |
 | pydantic | 数据校验 |
 | pyyaml | 配置加载 |
-| torch + clip | CLIP re-rank（屏中屏模式，复用网页模型 clip 包） |
-| pillow + ftfy | CLIP 模型依赖 |
 
-> CLIP re-rank 为可选依赖，加载失败时自动降级为纯"按涨幅精准放大"方案。
+无 GPU 依赖，无需深度学习框架，可在 CPU 环境部署。
 
 ---
 
@@ -553,7 +421,6 @@ clip_rerank:
 | 模块 B 策略路由 | < 1ms |
 | 模块 C 变换还原 | 200-500ms / 版本（最多 8 版本） |
 | 后端模型推理 | 取决于原模型（并行后取 max） |
-| CLIP re-rank（屏中屏专属） | 200-500ms / 版本（仅 anomaly<0.5 版本触发） |
 | 模块 D 一致性校验 | < 1ms |
 | 模块 E 结果融合 | < 1ms |
 
@@ -567,6 +434,5 @@ clip_rerank:
 |------|------|
 | 2026-06-28 | 初版：实现方案一完整五段式架构，含 A/B/C/D/E 五模块与 FastAPI 服务入口 |
 | 2026-06-28 | 新增垂直翻转、暗光蒙版、闪烁插入帧检测；启用保险机制（`mirror`/`vflip`/`brighten` 默认送审）；`max_restored_versions` 提升至 8 |
-| 2026-06-28 | 新增屏中屏检测（块方差分析 + 形态学开运算 + 连通域 + 轮廓检测备选 + 帧差法兜底）；分屏提取后放大到原始尺寸（INTER_LANCZOS4）；新增 `_sharpen`（Unsharp Mask）与 `_contrast`（CLAHE `clipLimit=4.0`）变换；3 种分屏组合变换链 |
-| 2026-06-28 | 双融合策略：`category_scores` 严格融合（仅 `triggered_labels`），`anomaly_score` 宽松融合（含 `is_harmful` / `calibrated` / 类别信号 / ood 信号）；`predicted_categories` 改为基于 `category_scores >= 0.5`，不继承原 API 误判；阈值下调 `label_jump_threshold: 0.4→0.15`、`label_cliff_threshold: 0.5→0.3`、`restored_high_confidence: 0.8→0.5` |
-| 2026-06-28 | **最终版**：新增 CLIP re-rank 模块（[clip_rerank.py](aedl/clip_rerank.py)），屏中屏模式下 AEDL 侧自做 CLIP re-rank 修正低分区间类别偏置；新增按涨幅精准放大机制（`_boost_scores_by_evidence`），涨得越多放大系数越大（3倍→×5，10倍→×10，50倍→×20，200倍→×25），涨得少不放大；移除一刀切强制 0.5 机制，改为基于真实信号动态调整 |
+| 2026-06-28 | 新增屏中屏检测（块方差分析 + 形态学开运算 + 连通域 + 轮廓检测备选）；分屏提取后放大到原始尺寸（INTER_LANCZOS4）；新增 `_sharpen`（Unsharp Mask）与 `_contrast`（CLAHE `clipLimit=4.0`）变换；3 种分屏组合变换链 |
+| 2026-06-28 | 双融合策略：`category_scores` 严格融合（仅 `triggered_labels`），`anomaly_score` 宽松融合（含 `is_harmful` / `calibrated` 显著提升条件）；分屏强制 `anomaly_score >= 0.5` 且强制人工审核；`predicted_categories` 改为基于 `category_scores >= 0.5`，不继承原 API 误判；阈值下调 `label_jump_threshold: 0.4→0.15`、`label_cliff_threshold: 0.5→0.3`、`restored_high_confidence: 0.8→0.5` |
